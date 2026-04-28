@@ -144,9 +144,18 @@ fi
 # install hp-scan wrapper
 install -m 0755 "$SCRIPT_DIR/bin/hp-scan" "$PREFIX/bin/hp-scan"
 
+# install HP Scan.app (clickable GUI wrapper) into ~/Applications
+APP="$HOME/Applications/HP Scan.app"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+install -m 0644 "$SCRIPT_DIR/app/Info.plist"   "$APP/Contents/Info.plist"
+install -m 0755 "$SCRIPT_DIR/app/hp-scan-app"  "$APP/Contents/MacOS/hp-scan-app"
+# refresh Launch Services so Spotlight / Dock find the new app
+/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$APP" >/dev/null 2>&1 || true
+
 green ""
 green "✔ done."
 green ""
-green "Try:   scanimage -L"
-green "       hp-scan ~/Desktop/test.pdf 300"
+green "Try:   scanimage -L                          # confirm scanner detected"
+green "       hp-scan ~/Desktop/test.pdf 300        # CLI scan"
+green "       open '$APP'                          # GUI scan (also in Spotlight as 'HP Scan')"
 green ""

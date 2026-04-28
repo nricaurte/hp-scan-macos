@@ -67,6 +67,7 @@ edits.
 
 ## Use
 
+**CLI:**
 ```bash
 scanimage -L                                      # should list your HP
 hp-scan                                           # scan to ~/Desktop/scan-<date>.pdf at 300 DPI color
@@ -74,8 +75,20 @@ hp-scan ~/Desktop/contract.pdf 300 gray           # custom path / DPI / mode
 scanimage -d hpaio:/usb/Smart_Tank_500_series?serial=XXX --resolution 600 -o foo.jpg
 ```
 
-Any SANE-compatible frontend (`xsane`, NAPS2, Skanlite via XQuartz, etc.) will
-also see the device once `hpaio` is registered.
+**GUI (HP Scan.app):**
+The build also installs a clickable `HP Scan.app` into `~/Applications/`. Double-click,
+pick DPI (100/150/200/300/600/1200), pick mode (Color/Gray), pick a save path, scan.
+The PDF opens in Preview automatically. Find it in Spotlight as "HP Scan".
+
+> **Why a custom .app?** macOS's built-in scan apps (HP Easy Scan, Image Capture,
+> Preview's "Import from Scanner") use Apple's **ICA** framework, which requires
+> a vendor driver in `/Library/Image Capture/Devices/`. HPLIP/hpaio is a **SANE**
+> backend — a parallel, Unix-style stack. The two don't bridge on macOS, so this
+> driver does not show up in HP Easy Scan or Image Capture. The bundled `HP Scan.app`
+> is a thin AppleScript+Bash wrapper that gives you a GUI without that bridge.
+
+Any other SANE-compatible frontend will also see the device once `hpaio` is
+registered: VueScan, XSane via XQuartz, etc.
 
 ## What the patches change
 

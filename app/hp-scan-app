@@ -1,0 +1,60 @@
+#!/bin/zsh
+# HP Scan.app — clickable wrapper around the SANE hpaio backend.
+export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+SCRIPT_LOG="/tmp/hp-scan-app.log"
+exec >"$SCRIPT_LOG" 2>&1
+set -x
+
+if ! command -v hp-scan >/dev/null 2>&1; then
+    osascript -e 'display alert "hp-scan no encontrado" message "Instala desde https://github.com/nricaurte/hp-scan-macos primero." as critical'
+    exit 1
+fi
+
+# 1) ¿Hay scanner detectado?
+if ! /opt/homebrew/bin/scanimage -L 2>/dev/null | grep -q '^device'; then
+    osascript -e 'display alert "No se detectó la impresora" message "Verifica que la HP esté encendida y conectada por USB, luego vuelve a intentar." as critical'
+    exit 1
+fi
+
+# 2) Pedir DPI
+RES=$(osascript <<'AS'
+choose from list {"100","150","200","300","600","1200"} with title "HP Scan" with prompt "Resolución (DPI):" default items {"300"} OK button name "Siguiente" cancel button name "Cancelar"
+AS
+)
+[[ "$RES" == "false" ]] && exit 0
+
+# 3) Pedir modo
+MODE=$(osascript <<'AS'
+choose from list {"Color","Gris"} with title "HP Scan" with prompt "Modo:" default items {"Color"} OK button name "Escanear" cancel button name "Cancelar"
+AS
+)
+[[ "$MODE" == "false" ]] && exit 0
+SMODE=color
+[[ "$MODE" == "Gris" ]] && SMODE=gray
+
+# 4) Pedir destino (con default razonable)
+DEFAULT_NAME="Scan-$(date +%Y-%m-%d-%H%M%S).pdf"
+DEST=$(osascript <<AS
+set defaultName to "$DEFAULT_NAME"
+try
+    set theFile to choose file name with prompt "Guardar PDF como:" default name defaultName default location (path to desktop folder)
+    return POSIX path of theFile
+on error
+    return "CANCEL"
+end try
+AS
+)
+[[ "$DEST" == "CANCEL" || -z "$DEST" ]] && exit 0
+[[ "$DEST" != *.pdf ]] && DEST="${DEST}.pdf"
+
+# 5) Notificación de inicio
+osascript -e 'display notification "Coloca el documento en el escáner..." with title "HP Scan" subtitle "Escaneando"'
+
+# 6) Escanear
+if /opt/homebrew/bin/hp-scan "$DEST" "$RES" "$SMODE"; then
+    osascript -e "display notification \"$(basename "$DEST")\" with title \"HP Scan\" subtitle \"Listo\" sound name \"Glass\""
+    /usr/bin/open "$DEST"
+else
+    osascript -e 'display alert "Error escaneando" message "Detalles en /tmp/hp-scan-app.log" as critical'
+    exit 1
+fi
