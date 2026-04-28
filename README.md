@@ -32,8 +32,8 @@ without further changes — open an issue if not.
 ## Install
 
 ```bash
-git clone https://github.com/<you>/hplip-macos.git
-cd hplip-macos
+git clone https://github.com/nricaurte/hp-scan-macos.git
+cd hp-scan-macos
 ./build.sh
 ```
 
@@ -42,6 +42,28 @@ compiles to `/opt/homebrew/lib/sane/libsane-hpaio.1.so`, registers `hpaio`
 in `/opt/homebrew/etc/sane.d/dll.conf`, and installs `hp-scan` wrapper.
 
 If you don't use Homebrew at the default location, set `PREFIX=/your/path`.
+
+## Install with Claude Code
+
+If you have [Claude Code](https://claude.com/claude-code) installed, you can
+let it do the whole thing. Open a terminal in any directory you don't mind a
+clone landing in, run `claude`, and paste:
+
+> Install the HP scanner backend from `https://github.com/nricaurte/hp-scan-macos`
+> for my HP Smart Tank 500 (USB). Clone it, read the README, run `./build.sh`,
+> then run `scanimage -L` to confirm the printer appears, and finally test a
+> scan with `hp-scan ~/Desktop/test.pdf 200`. The build needs `brew`, `gcc`,
+> `make`, `libusb`, and `sane-backends` — install anything missing.
+
+Claude will clone the repo, install Homebrew prerequisites, run the build,
+and verify scanning works end-to-end. Approve any `Bash` permission prompts
+as they come up. Replace "Smart Tank 500" with whatever HP USB printer you
+have — the same backend handles every LEDM-over-USB model.
+
+If something fails mid-build, paste the error back to Claude — the patches
+in this repo are narrow, but other LEDM models may need an additional
+quirk. Most failures are header/include issues fixable in one or two
+edits.
 
 ## Use
 
