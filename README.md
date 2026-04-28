@@ -4,6 +4,10 @@ A working SANE scanner backend for HP USB-only inkjet/AIO printers on macOS,
 including Apple Silicon. Builds HPLIP's `hpaio` backend from source with the
 patches needed to compile and run on Darwin.
 
+![Image Capture discovering the bridged HP Smart Tank 500](docs/image-capture-discovered.png)
+
+*macOS Image Capture seeing the USB-only HP Smart Tank 500 as a network scanner under "Shared" via the bundled `airscan-bridge`.*
+
 ## Why this exists
 
 HP doesn't ship a macOS scanner driver for low-end USB-only models like the
