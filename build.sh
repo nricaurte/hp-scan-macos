@@ -152,6 +152,23 @@ install -m 0755 "$SCRIPT_DIR/app/hp-scan-app"  "$APP/Contents/MacOS/hp-scan-app"
 # refresh Launch Services so Spotlight / Dock find the new app
 /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$APP" >/dev/null 2>&1 || true
 
+# build & install airscan-bridge (eSCL → SANE adapter so Apple's native scan
+# apps -- Image Capture, Preview, HP Easy Scan, Notes, iPhone/iPad scan -- can
+# discover and use the printer over Bonjour without needing an ICA driver).
+if command -v go >/dev/null 2>&1; then
+    blue "==> building airscan-bridge"
+    (cd "$SCRIPT_DIR/airscan-bridge" && go build -o airscan-bridge .)
+    install -m 0755 "$SCRIPT_DIR/airscan-bridge/airscan-bridge" "$PREFIX/bin/airscan-bridge"
+    green ""
+    green "Optional: install LaunchAgent so the bridge starts at login:"
+    green "  cp $SCRIPT_DIR/airscan-bridge/com.nricaurte.hp-airscan.plist ~/Library/LaunchAgents/"
+    green "  launchctl load -w ~/Library/LaunchAgents/com.nricaurte.hp-airscan.plist"
+    green ""
+    green "Or run it ad-hoc:  airscan-bridge &"
+else
+    blue "==> skipping airscan-bridge build (Go not installed)"
+fi
+
 green ""
 green "✔ done."
 green ""
