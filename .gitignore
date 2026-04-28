@@ -1,0 +1,8 @@
+.DS_Store
+build/
+*.tar.gz
+hplip-*/
+*.o
+*.lo
+*.la
+.libs/

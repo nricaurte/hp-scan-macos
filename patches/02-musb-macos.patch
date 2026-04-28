@@ -1,0 +1,44 @@
+--- a/io/hpmud/musb.c
++++ b/io/hpmud/musb.c
+@@ -758,7 +758,7 @@ static int device_id(int fd, unsigned char *buffer, int size)
+
+     maxSize = (size > 1024) ? 1024 : size;   /* RH8 has a size limit for device id (usb) */
+
+-    rlen = libusb_control_transfer(hd,
++    rlen = libusb_control_transfer(hd,                          /* macOS: see workaround below */
+             LIBUSB_ENDPOINT_IN | LIBUSB_REQUEST_TYPE_CLASS | LIBUSB_RECIPIENT_INTERFACE, /* bmRequestType */
+             LIBUSB_REQUEST_GET_STATUS,        /* bRequest */
+             config,        /* wValue */
+@@ -767,8 +767,21 @@ static int device_id(int fd, unsigned char *buffer, int size)
+
+     if (rlen < 0)
+     {
++#ifdef __APPLE__
++        /* macOS workaround: some HP printer firmwares (Smart Tank 500 etc.)
++         * do not implement IEEE 1284 GET_DEVICE_ID via USB control transfer
++         * and reject with STALL (LIBUSB_ERROR_PIPE). Synthesize a minimal
++         * device ID so the rest of hpmud accepts the device. The real model
++         * info is already known from the iProduct string descriptor read by
++         * musb_probe_devices(). */
++        const char *fake_id = "MFG:HP;CMD:LEDM;CLS:PRINTER;";
++        int fake_len = (int)strlen(fake_id);
++        if (fake_len >= size) fake_len = size - 1;
++        memcpy(buffer, fake_id, fake_len);
++        buffer[fake_len] = 0;
++        return fake_len;
++#else
+         BUG("invalid deviceid ret=%d: %m\n", rlen);
+         goto bugout;
++#endif
+     }
+
+     len = ntohs(*(short *)buffer);
+@@ -2178,7 +2191,7 @@ int __attribute__ ((visibility ("hidden"))) musb_probe_devices(char *lst, int ls
+     }//end for loop
+
+ bugout:
+-    if (!hd)
++    if (hd)            /* fix: previous code closed a NULL handle on success path */
+         libusb_close(hd);
+     if (confptr)
+         libusb_free_config_descriptor(confptr);

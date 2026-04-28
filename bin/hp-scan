@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# hp-scan — scan a single page from any HP printer detected by hpaio.
+#
+# Usage:
+#   hp-scan [output_path] [resolution_dpi] [color|gray]
+#
+# Examples:
+#   hp-scan                                 # scans to ~/Desktop/scan-<date>.pdf at 300 DPI color
+#   hp-scan ~/Desktop/contract.pdf
+#   hp-scan ~/Desktop/photo.pdf 600 color
+#   hp-scan ~/Desktop/text.pdf 300 gray
+
+set -euo pipefail
+
+OUT="${1:-$HOME/Desktop/scan-$(date +%Y%m%d-%H%M%S).pdf}"
+RES="${2:-300}"
+MODE_INPUT="${3:-color}"
+case "$MODE_INPUT" in
+    gray|grey|Gray) SANE_MODE="Gray" ;;
+    *)              SANE_MODE="Color" ;;
+esac
+
+# Auto-detect first hpaio device.
+DEV=$(scanimage -L 2>/dev/null | awk -F"'" '/hpaio:/{print $2; exit}')
+if [[ -z "${DEV:-}" ]]; then
+    echo "✗ no HP scanner detected. Is the printer powered on and USB connected?"
+    echo "  run \`scanimage -L\` to debug."
+    exit 1
+fi
+
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
+
+echo "→ scanning on $DEV  (${RES} DPI, $SANE_MODE) ..."
+scanimage -d "$DEV" --resolution "$RES" --mode "$SANE_MODE" --format=jpeg \
+    -o "$TMP/page.jpg" 2>/dev/null
+
+if [[ ! -s "$TMP/page.jpg" ]]; then
+    echo "✗ scan produced no data."
+    exit 1
+fi
+
+# Convert to PDF using macOS's built-in sips.
+sips -s format pdf "$TMP/page.jpg" --out "$OUT" >/dev/null
+echo "✔ saved: $OUT"
+
+# Open it for the user.
+[[ -t 1 ]] && open "$OUT" || true

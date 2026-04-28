@@ -1,0 +1,31 @@
+--- a/scan/sane/bb_ledm.c
++++ b/scan/sane/bb_ledm.c
+@@ -27,6 +27,8 @@
+ # include "http.h"
+ # include "xml.h"
+ # include <stdlib.h>
++# include <unistd.h>
++# include <sys/time.h>
+ 
+ # include <stdint.h>
+ 
+--- a/scan/sane/http.c
++++ b/scan/sane/http.c
+@@ -36,6 +36,7 @@
+ #include <string.h>
+ #include <syslog.h>
+ #include <ctype.h>
++#include <unistd.h>
+ #include "hpmud.h"
+ #include "http.h"
+ 
+--- a/scan/sane/sclpml.c
++++ b/scan/sane/sclpml.c
+@@ -29,6 +29,7 @@
+ #include <string.h>
+ #include <unistd.h>
+ #include <fcntl.h>
++#include <sys/time.h>
+ #include <string.h>
+ #include "sane.h"
+ #include "saneopts.h"
