@@ -80,15 +80,35 @@ The build also installs a clickable `HP Scan.app` into `~/Applications/`. Double
 pick DPI (100/150/200/300/600/1200), pick mode (Color/Gray), pick a save path, scan.
 The PDF opens in Preview automatically. Find it in Spotlight as "HP Scan".
 
-> **Why a custom .app?** macOS's built-in scan apps (HP Easy Scan, Image Capture,
-> Preview's "Import from Scanner") use Apple's **ICA** framework, which requires
-> a vendor driver in `/Library/Image Capture/Devices/`. HPLIP/hpaio is a **SANE**
-> backend — a parallel, Unix-style stack. The two don't bridge on macOS, so this
-> driver does not show up in HP Easy Scan or Image Capture. The bundled `HP Scan.app`
-> is a thin AppleScript+Bash wrapper that gives you a GUI without that bridge.
+**Image Capture / Preview / Notes / iPhone-iPad (via airscan-bridge):**
+The build also installs a small Go service (`airscan-bridge`) that advertises
+the scanner over Bonjour as an AirScan/eSCL network device on the loopback
+interface. Apple's native scan stack (`Image Capture.app`, Preview's
+*Import from Scanner*, Notes' document scan, iOS Files / Notes scan over
+local network) all use AirScan, so the printer shows up under **Shared** in
+Image Capture as `Smart Tank 500 series (USB-bridge)` without any ICA driver.
 
-Any other SANE-compatible frontend will also see the device once `hpaio` is
-registered: VueScan, XSane via XQuartz, etc.
+Run it ad-hoc:
+```bash
+airscan-bridge &
+```
+Or persist across reboots with the bundled LaunchAgent:
+```bash
+cp airscan-bridge/com.nricaurte.hp-airscan.plist ~/Library/LaunchAgents/
+launchctl load -w ~/Library/LaunchAgents/com.nricaurte.hp-airscan.plist
+```
+
+> **Why all these layers?** macOS's native scan apps use Apple's **ICA**
+> framework, which requires a vendor driver in `/Library/Image Capture/Devices/`.
+> HPLIP/hpaio is a **SANE** backend — a parallel, Unix-style stack — so it
+> doesn't show up in those apps directly. AirScan/eSCL is the third stack
+> Apple uses for network scanners; we expose hpaio as an eSCL endpoint on
+> localhost and Bonjour does the rest. End result: scanning works in every
+> Apple scan app *except* HP Easy Scan, which is HP's own closed app and
+> only trusts HP's own discovery channel.
+
+Any SANE-compatible frontend (VueScan, XSane via XQuartz, etc.) will also
+see the device through the SANE side once `hpaio` is registered.
 
 ## What the patches change
 
