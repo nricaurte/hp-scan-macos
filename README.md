@@ -17,17 +17,49 @@ printers fine, but it's Linux-only. This repo packages the Darwin port of
 HPLIP's scanner backend so you get the same free scanning macOS users already
 take for granted on Wi-Fi-capable HP models.
 
-## Tested with
+## Tested
 
-- macOS 26 (Tahoe), arm64 (Apple Silicon)
-- HPLIP 3.25.8
-- Homebrew `sane-backends` 1.4.0 + `libusb` 1.0.29
-- HP Smart Tank 500 series (USB)
+| Component | Confirmed working |
+|---|---|
+| macOS 26 (Tahoe), arm64 (Apple Silicon) | ✅ |
+| HPLIP 3.25.8 | ✅ |
+| Homebrew `sane-backends` 1.4.0, `libusb` 1.0.29, `go` 1.26+ | ✅ |
+| **HP Smart Tank 500 series (USB-only)** | ✅ |
 
-Probably also works for any HP model HPLIP marks as `scan-type=7` (LEDM)
-that doesn't have IPP-over-USB in its firmware. Models in the same family
-(Smart Tank 510 USB, Deskjet Ink Advantage, Envy 6000 USB, etc.) should work
-without further changes — open an issue if not.
+That's the only model verified end-to-end so far. The rest of the table is what
+*should* work given how the patches are written, but **untested — please open an
+issue with your model if you try one**.
+
+### Models that should work without further changes
+
+Any HP printer that HPLIP marks as `scan-type=7` (LEDM) and is USB-only or
+USB-attached. That includes (verify by greping `data/models/models.dat` in the
+HPLIP source for `scan-type=7`):
+
+- HP Smart Tank 500 series ← tested
+- HP Smart Tank 510, 530, 550, 570, 580 series (USB variants)
+- HP Deskjet 2700, 2300, 4100 series (USB)
+- HP Envy 6000, 6020, 6030, 6400 series (USB-attached)
+- HP DeskJet Ink Advantage 2300, 2700, 6400 series
+- HP OfficeJet 3830, 4650, 5200 series (USB)
+- HP LaserJet MFP M28w, M139w, M140 series (USB)
+
+### Models that probably need extra patches
+
+- Anything with `scan-type=4` or `8` (Marvell) — different USB scan protocol;
+  the macOS device-id workaround in `02-musb-macos.patch` may need adapting.
+- Anything that requires HPLIP's binary plugin (`hp-plugin`) — the build
+  script will tell you if your model needs one. Smart Tank 500 doesn't.
+- Anything with Wi-Fi where you'd rather just use AirPrint scan natively —
+  if your printer already shows up in Image Capture without this repo, you
+  don't need any of this.
+
+### Will likely **not** work
+
+- Older parallel-port HPs (we disable `--enable-pp-build`).
+- HPs that use proprietary closed protocols (some old DesignJet plotters).
+- Anything connected over network where AirScan/IPP is already supposed to work
+  but doesn't — that's a different problem (firmware/Bonjour, not driver).
 
 ## Install
 
@@ -123,6 +155,22 @@ see the device through the SANE side once `hpaio` is registered.
 The `Makefile` is also patched at build time (in `build.sh`) to:
 - set `hplip_confdir = $PREFIX/etc/hp` instead of `/etc/hp` (so install doesn't need sudo);
 - drop `libhpipp.la` from `libsane-hpaio.la` link deps (it's an empty archive when network/IPP build is disabled, and `ar cr` errors on empty archives on macOS).
+
+## Troubleshooting
+
+If you got here from a search engine, here are the literal symptoms this repo fixes:
+
+- **"HP Smart Tank 500 not detected as scanner on macOS"** → install this.
+- **"HP Smart isn't finding my printer Mac"** → HP Smart needs Wi-Fi, your model is USB. Install this.
+- **"Image Capture doesn't see HP USB printer"** → Apple ICA stack has no driver for your model. Install this + run `airscan-bridge`.
+- **"Preview Import from Scanner missing on Mac"** → No driver in `/Library/Image Capture/Devices/`. Install this + run `airscan-bridge`.
+- **"HP Easy Scan: select your scanner / no scanner found"** → HP Easy Scan filters by HP's closed channel, won't see this driver. Use Image Capture or Preview instead, both work via `airscan-bridge`.
+- **"HP scanner support drop macOS Sonoma / Sequoia / Tahoe"** → Apple deprecating CUPS drivers and ICA. AirScan/eSCL is the surviving path; this repo bridges it.
+- **"VueScan is paid, HP Smart doesn't work, what now"** → this. Free, GPL, no watermark.
+- **`scanimage: no SANE devices found`** → SANE backend not registered. Run `./build.sh` or check `/opt/homebrew/etc/sane.d/dll.conf` contains `hpaio`.
+- **`hpaio: ledm get_device_id failed: LIBUSB_ERROR_PIPE`** → known Smart Tank firmware quirk. The patch in `02-musb-macos.patch` synthesizes a fake IEEE 1284 device id to work around it. If you see this AFTER applying patches, your model has a different quirk — open an issue.
+- **`Error during device I/O`** → USB interface is being held by another process. Common culprits: VueScan trial running in background, HP Smart, an existing CUPS print job. Quit those and retry.
+- **`No IPP over USB devices found`** (from `ipp-usb`) — that tool is unrelated to this repo; this repo specifically handles printers that *don't* speak IPP-over-USB.
 
 ## Caveats / known issues
 
