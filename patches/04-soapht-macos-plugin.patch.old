@@ -1,0 +1,75 @@
+--- a/scan/sane/soapht.c
++++ b/scan/sane/soapht.c
+@@
+ static int bb_load(struct soap_session *ps, const char *so)
+ {
+    int stat=1;
+
++#ifdef __APPLE__
++   /*
++    * SOAPHT macOS support.
++    *
++    * bb_soapht.so references hpmud_open_channel(),
++    * hpmud_read_channel(), hpmud_write_channel() and
++    * hpmud_close_channel() dynamically.
++    *
++    * Export libhpmud symbols globally before loading the plugin.
++    */
++   ps->hpmud_handle =
++       dlopen("/opt/homebrew/lib/libhpmud.0.dylib",
++              RTLD_LAZY | RTLD_GLOBAL);
++
++   if (ps->hpmud_handle == NULL)
++   {
++      BUG("unable to load libhpmud.0.dylib: %s\n", dlerror());
++      goto bugout;
++   }
++
++   /*
++    * macOS math functions are part of libSystem.
++    * No separate libm.so is required.
++    */
++   ps->math_handle = NULL;
++#else
+    /* Load hpmud manually with symbols exported. Otherwise the plugin will not find it. */
+    if ((ps->hpmud_handle = load_library("libhpmud.so.0")) == NULL)
+    {
+        if ((ps->hpmud_handle = load_library("libhpmud.so.0")) == NULL)
+            goto bugout;
+    }
+
+    /* Load math library manually with symbols exported (Ubuntu 8.04). Otherwise the plugin will not find it. */
+    if ((ps->math_handle = load_library("libm.so")) == NULL)
+    {
+       if ((ps->math_handle = load_library("libm.so.6")) == NULL)
+          goto bugout;
+    }
++#endif
+
+    if ((ps->bb_handle = load_plugin_library(UTILS_SCAN_PLUGIN_LIBRARY, so)) == NULL)
+    {
+       SendScanEvent(ps->uri, EVENT_PLUGIN_FAIL);
+       goto bugout;
+@@
+ static int bb_unload(struct soap_session *ps)
+ {
+     unload_library(ps->bb_handle);
+     ps->bb_handle = NULL;
+
+-    unload_library(ps->hpmud_handle);
++#ifdef __APPLE__
++    if (ps->hpmud_handle)
++       dlclose(ps->hpmud_handle);
++#else
++    unload_library(ps->hpmud_handle);
++#endif
+     ps->hpmud_handle = NULL;
+
+-    unload_library(ps->math_handle);
++#ifndef __APPLE__
++    unload_library(ps->math_handle);
++#endif
+     ps->math_handle = NULL;
+
+    return 0;
+ }

@@ -1,0 +1,540 @@
+--- a/scan/sane/soapht.c
++++ b/scan/sane/soapht.c
+@@ -59,61 +59,123 @@
+ 
+ static int bb_load(struct soap_session *ps, const char *so)
+ {
+-   int stat=1;
+-
+-   /* Load hpmud manually with symbols exported. Otherwise the plugin will not find it. */ 
+-   if ((ps->hpmud_handle = load_library("libhpmud.so.0")) == NULL)
+-   {
+-	   if ((ps->hpmud_handle = load_library("libhpmud.so.0")) == NULL)
+-           goto bugout;
+-   }
+-
+-   /* Load math library manually with symbols exported (Ubuntu 8.04). Otherwise the plugin will not find it. */ 
+-   if ((ps->math_handle = load_library("libm.so")) == NULL)
+-   {
+-      if ((ps->math_handle = load_library("libm.so.6")) == NULL)
+-         goto bugout;
+-   } 
+-
+-   if ((ps->bb_handle = load_plugin_library(UTILS_SCAN_PLUGIN_LIBRARY, so)) == NULL)
+-   {
+-      SendScanEvent(ps->uri, EVENT_PLUGIN_FAIL);
+-      goto bugout;
+-   } 
+-
+-   if ((ps->bb_open = get_library_symbol(ps->bb_handle, "bb_open")) == NULL)
+-      goto bugout;
+- 
+-   if ((ps->bb_close = get_library_symbol(ps->bb_handle, "bb_close")) == NULL)
+-      goto bugout;
+-
+-   if ((ps->bb_get_parameters = get_library_symbol(ps->bb_handle, "bb_get_parameters")) == NULL)
+-      goto bugout;
+-
+-   if ((ps->bb_is_paper_in_adf = get_library_symbol(ps->bb_handle, "bb_is_paper_in_adf")) == NULL)
+-      goto bugout;
+-
+-   if ((ps->bb_start_scan = get_library_symbol(ps->bb_handle, "bb_start_scan")) == NULL)
+-      goto bugout;
+-
+-   if ((ps->bb_end_scan = get_library_symbol(ps->bb_handle, "bb_end_scan")) == NULL)
+-      goto bugout;
+-
+-   if ((ps->bb_get_image_data = get_library_symbol(ps->bb_handle, "bb_get_image_data")) == NULL)
+-      goto bugout;
+-
+-   if ((ps->bb_end_page = get_library_symbol(ps->bb_handle, "bb_end_page")) == NULL)
+-      goto bugout;
+-
+-
+-   stat=0;
++    int stat = 1;
++
++    DBG8("[soapht] bb_load entered so=%s\n", so);
++
++#ifdef __APPLE__
++
++    /*
++     * Our replacement bb_soapht.so resolves hpmud_* symbols dynamically.
++     * Make libhpmud globally visible before loading the plugin.
++     */
++    ps->hpmud_handle =
++        dlopen("/opt/homebrew/lib/libhpmud.0.dylib",
++               RTLD_NOW | RTLD_GLOBAL);
++
++    if (ps->hpmud_handle == NULL)
++    {
++        BUG("[soapht] libhpmud dlopen FAILED: %s\n",
++                dlerror());
++        goto bugout;
++    }
++
++    DBG8("[soapht] libhpmud loaded handle=%p\n",
++            ps->hpmud_handle);
++
++    /*
++     * macOS has math functions in libSystem.
++     */
++    ps->math_handle = NULL;
++
++    /*
++     * Do not use HPLIP's proprietary-plugin loader on macOS.
++     * Load our native Mach-O replacement directly.
++     */
++    const char *plugin = getenv("HPAIO_SOAPHT_PLUGIN");
++    if (plugin == NULL || *plugin == '\0')
++        plugin = "/opt/homebrew/share/hplip/scan/plugins/bb_soapht.so";
++    ps->bb_handle = dlopen(plugin, RTLD_NOW | RTLD_GLOBAL);
++
++    if (ps->bb_handle == NULL)
++    {
++        BUG("[soapht] bb_soapht.so dlopen FAILED: %s\n",
++                dlerror());
++        goto bugout;
++    }
++
++    DBG8("[soapht] bb_soapht.so loaded successfully handle=%p\n",
++            ps->bb_handle);
++
++#else
++
++    if ((ps->hpmud_handle =
++         load_library("libhpmud.so.0")) == NULL)
++    {
++        goto bugout;
++    }
++
++    if ((ps->math_handle = load_library("libm.so")) == NULL)
++    {
++        if ((ps->math_handle =
++             load_library("libm.so.6")) == NULL)
++            goto bugout;
++    }
++
++    if ((ps->bb_handle =
++         load_plugin_library(UTILS_SCAN_PLUGIN_LIBRARY, so)) == NULL)
++    {
++        SendScanEvent(ps->uri, EVENT_PLUGIN_FAIL);
++        goto bugout;
++    }
++
++#endif
++
++#define LOAD_BB_SYMBOL(member, name)                              \
++    do {                                                         \
++        ps->member = get_library_symbol(ps->bb_handle, name);     \
++        if (ps->member == NULL)                                  \
++        {                                                        \
++            BUG("missing SOAPHT symbol %s\n", name);             \
++            goto bugout;                                        \
++        }                                                        \
++    } while (0)
++
++    LOAD_BB_SYMBOL(bb_open, "bb_open");
++    LOAD_BB_SYMBOL(bb_close, "bb_close");
++    LOAD_BB_SYMBOL(bb_get_parameters, "bb_get_parameters");
++    LOAD_BB_SYMBOL(bb_is_paper_in_adf, "bb_is_paper_in_adf");
++    LOAD_BB_SYMBOL(bb_start_scan, "bb_start_scan");
++    LOAD_BB_SYMBOL(bb_end_scan, "bb_end_scan");
++    LOAD_BB_SYMBOL(bb_get_image_data, "bb_get_image_data");
++    LOAD_BB_SYMBOL(bb_end_page, "bb_end_page");
++
++#undef LOAD_BB_SYMBOL
++
++    stat = 0;
++
++    DBG8("[soapht] bb_load OK\n");
+ 
+ bugout:
+-   return stat;
++    return stat;
+ } /* bb_load */
+ 
+ static int bb_unload(struct soap_session *ps)
+ {
++#ifdef __APPLE__
++
++    if (ps->bb_handle)
++        dlclose(ps->bb_handle);
++    ps->bb_handle = NULL;
++
++    if (ps->hpmud_handle)
++        dlclose(ps->hpmud_handle);
++    ps->hpmud_handle = NULL;
++
++    ps->math_handle = NULL;
++
++#else
++
+     unload_library(ps->bb_handle);
+     ps->bb_handle = NULL;
+ 
+@@ -123,12 +185,35 @@
+     unload_library(ps->math_handle);
+     ps->math_handle = NULL;
+ 
+-   return 0;
+-} /* bb_unload */
++#endif
++
++    return 0;
++}/* bb_unload */
++
++/* Native macOS plugin returns SANE errors; legacy plugins return booleans.
++ * Keep the public soap_session layout and the Linux failure convention. */
++static SANE_Status bb_error_status(int result)
++{
++#ifdef __APPLE__
++   switch (result)
++   {
++      case SANE_STATUS_UNSUPPORTED:
++      case SANE_STATUS_DEVICE_BUSY:
++      case SANE_STATUS_JAMMED:
++      case SANE_STATUS_CANCELLED:
++      case SANE_STATUS_NO_MEM:
++      case SANE_STATUS_INVAL:
++         return (SANE_Status)result;
++   }
++#endif
++   return SANE_STATUS_IO_ERROR;
++}
+ 
+ /* Get raw data (ie: uncompressed data) from image processor. */
+-static int get_ip_data(struct soap_session *ps, SANE_Byte *data, SANE_Int maxLength, SANE_Int *length)
+-{
++static int get_ip_data(struct soap_session *ps, SANE_Byte *data, SANE_Int maxLength, SANE_Int *length, SANE_Status *io_status)
++{
++   int result;
++   *io_status = SANE_STATUS_IO_ERROR;
+    int ip_ret=IP_INPUT_ERROR;
+    unsigned int outputAvail=maxLength, outputUsed=0, outputThisPos;
+    unsigned char *input, *output = data;
+@@ -140,8 +225,11 @@
+       goto bugout;
+    }      
+ 
+-   if (ps->bb_get_image_data(ps, outputAvail))
++   if ((result = ps->bb_get_image_data(ps, outputAvail)) != 0)
++   {
++      *io_status = bb_error_status(result);
+       goto bugout;
++   }
+ 
+    if (ps->cnt > 0)
+    {
+@@ -197,8 +285,10 @@
+       case CE_GRAY8:
+       case CE_RGB24:
+       default:
+-         ps->compressionList[j] = STR_COMPRESSION_NONE; 
++#ifndef __APPLE__
++         ps->compressionList[j] = STR_COMPRESSION_NONE;
+          ps->compressionMap[j++] = SF_HPRAW;
++#endif
+          ps->compressionList[j] = STR_COMPRESSION_JPEG; 
+          ps->compressionMap[j++] = SF_JFIF;
+          ps->currentCompression = SF_JFIF;
+@@ -208,6 +298,18 @@
+ 
+    return 0;
+ } /* set_scan_mode_side_effects */
++
++#ifdef __APPLE__
++/* Preserve the tested ADF default without rewriting explicit Legal requests
++ * later in the plugin. The advertised hardware maximum remains 14 inches. */
++static void set_adf_default_height(struct soap_session *ps)
++{
++   const SANE_Fixed height = SANE_FIX(11.689 * MM_PER_INCH);
++   if (ps->currentInputSource == IS_ADF &&
++       ps->currentTly == ps->tlyRange.min && ps->currentBry > height)
++      ps->currentBry = height;
++}
++#endif
+ 
+ static int set_input_source_side_effects(struct soap_session *ps, enum INPUT_SOURCE source)
+ {
+@@ -239,7 +341,26 @@
+         ps->currentBrx = ps->brxRange.max;
+         ps->currentTlx = ps->tlxRange.min;
+         ps->currentBry = ps->bryRange.max;
++#ifdef __APPLE__
++        set_adf_default_height(ps);
++#endif
+     }
++
++#ifdef __APPLE__
++   /* Source capabilities can differ or the device may have no platen. */
++   const SANE_Int *resolutions = source == IS_PLATEN ?
++       ps->platen_resolutionList : ps->adf_resolutionList;
++   memcpy(ps->resolutionList, resolutions, sizeof(ps->resolutionList));
++   int valid = 0;
++   for (int r = 1; r <= resolutions[0]; r++)
++      if (resolutions[r] == ps->currentResolution) valid = 1;
++   if (!valid)
++   {
++      ps->currentResolution = resolutions[1];
++      for (int r = 1; r <= resolutions[0]; r++)
++         if (resolutions[r] == 300) ps->currentResolution = 300;
++   }
++#endif
+ 
+    return 0;
+ } /* set_input_source_side_effects */
+@@ -470,33 +591,33 @@
+    snprintf(session->uri, sizeof(session->uri)-1, "hp:%s", device);   /* prepend "hp:" */
+ 
+    /* Get actual model attributes from models.dat. */
+-   hpmud_query_model(session->uri, &ma);
++   if (hpmud_query_model(session->uri, &ma) != HPMUD_R_OK)
++   {
++      BUG("unable to query model %s\n", session->uri);
++      goto bugout;
++   }
+    session->scan_type = ma.scantype;
+ 
+-   if (hpmud_open_device(session->uri, ma.mfp_mode, &session->dd) != HPMUD_R_OK)
+-   {
+-      BUG("unable to open device %s\n", session->uri);
++   int result = hpmud_open_device(session->uri, ma.mfp_mode, &session->dd);
++   if (result != HPMUD_R_OK)
++   {
++      BUG("unable to open device %s: %d\n", session->uri, result);
++      if (result == HPMUD_R_DEVICE_BUSY)
++         stat = SANE_STATUS_DEVICE_BUSY;
+       goto bugout;
+-
+-      free(session);
+-      session = NULL;
+-      return SANE_STATUS_IO_ERROR;
+    }
+ 
+    if (bb_load(session, SCAN_PLUGIN_SOAPHT))
+-   {
+-      stat = SANE_STATUS_IO_ERROR;
+       goto bugout;
+-   }
+-
+-   /* Init sane option descriptors. */
+-   init_options(session);  
+-
+-   if (session->bb_open(session))
+-   {
+-      stat = SANE_STATUS_IO_ERROR;
++
++   if ((result = session->bb_open(session)) != 0)
++   {
++      stat = bb_error_status(result);
+       goto bugout;
+    }
++
++   /* Build option descriptors only after bb_open populated capabilities. */
++   init_options(session);
+ 
+    /* Set supported Scan Modes as determined by bb_open. */
+    soapht_control_option(session, SOAP_OPTION_SCAN_MODE, SANE_ACTION_SET_AUTO, NULL, NULL); /* set default option */
+@@ -535,6 +656,8 @@
+    {
+       if (session)
+       {
++         if (session->bb_session && session->bb_close)
++            session->bb_close(session);
+          bb_unload(session);
+          if (session->dd > 0)
+             hpmud_close_device(session->dd);
+@@ -558,6 +681,11 @@
+       return;
+    }
+ 
++   if (ps->ip_handle)
++   {
++      ipClose(ps->ip_handle);
++      ps->ip_handle = 0;
++   }
+    ps->bb_close(ps);
+    bb_unload(ps);
+ 
+@@ -701,7 +829,13 @@
+          }
+          else
+          {  /* Set default. */
++#ifdef __APPLE__
++            ps->currentResolution = ps->resolutionList[1];
++            for (i = 1; i <= ps->resolutionList[0]; i++)
++               if (ps->resolutionList[i] == 300) ps->currentResolution = 300;
++#else
+             ps->currentResolution = 75;
++#endif
+             stat = SANE_STATUS_GOOD;
+          }
+          break;
+@@ -892,6 +1026,9 @@
+          else
+          {  /* Set default. */
+             ps->currentBry = ps->bryRange.max;
++#ifdef __APPLE__
++            set_adf_default_height(ps);
++#endif
+             stat = SANE_STATUS_GOOD;
+          }
+          break;
+@@ -937,9 +1074,24 @@
+    IP_IMAGE_TRAITS traits;
+    IP_XFORM_SPEC xforms[IP_MAX_XFORMS], *pXform=xforms;
+    int stat, ret;
++   SANE_Status io_status;
+ 
+    DBG8("sane_hpaio_start()\n");
+    
++#ifdef __APPLE__
++   /* A cancel callback only sets a flag. Finish a previous cancellation here
++    * before clearing it, so the same handle can safely start a fresh job. */
++   if (ps->user_cancel)
++   {
++      if (ps->ip_handle)
++      {
++         ipClose(ps->ip_handle);
++         ps->ip_handle = 0;
++      }
++      ret = ps->bb_end_scan(ps, 0);
++      if (ret) return bb_error_status(ret);
++   }
++#endif
+     ps -> user_cancel = 0;
+     ps -> cnt = 0;
+     ps -> index = 0;
+@@ -964,15 +1116,15 @@
+       }
+       else if (ret < 0)
+       {
+-         stat = SANE_STATUS_IO_ERROR;
++         stat = bb_error_status(-ret);
+          goto bugout;
+       }
+    }
+ 
+    /* Start scan and get actual image traits. */
+-   if (ps->bb_start_scan(ps))
+-   {
+-      stat = SANE_STATUS_IO_ERROR;
++   if ((ret = ps->bb_start_scan(ps)) != 0)
++   {
++      stat = bb_error_status(ret);
+       goto bugout;
+    }
+    SendScanEvent(ps->uri, EVENT_START_SCAN_JOB);
+@@ -1071,12 +1223,12 @@
+       /* Wait for image processor to process header so we know the exact size of the image for sane_get_params. */
+       while (1)
+       {
+-         ret = get_ip_data(ps, NULL, 0, NULL);
++         ret = get_ip_data(ps, NULL, 0, NULL, &io_status);
+ 
+          if (ret & (IP_INPUT_ERROR | IP_FATAL_ERROR | IP_DONE))
+          {
+             BUG("ipConvert error=%x\n", ret);
+-            stat = SANE_STATUS_IO_ERROR;
++            stat = io_status;
+             goto bugout;
+          }
+ 
+@@ -1111,20 +1263,30 @@
+ {
+    struct soap_session *ps = (struct soap_session *)handle;
+    int ret, stat=SANE_STATUS_IO_ERROR;
++   SANE_Status io_status;
++   *length = 0;
+ 
+    DBG8("sane_hpaio_read() handle=%p data=%p maxLength=%d\n", (void *)handle, data, maxLength);
+    if(ps->user_cancel)
+    {
+      DBG8("soapht_read() EVENT_SCAN_CANCEL****uri=%s\n", ps->uri);
+      SendScanEvent(ps->uri, EVENT_SCAN_CANCEL);
+-     return SANE_STATUS_CANCELLED;
+-   }
+-  
+-   ret = get_ip_data(ps, data, maxLength, length);
+-
+-   if(ret & (IP_INPUT_ERROR | IP_FATAL_ERROR))
++     stat = SANE_STATUS_CANCELLED;
++     goto bugout;
++   }
++
++   ret = get_ip_data(ps, data, maxLength, length, &io_status);
++
++   if (ps->user_cancel)
++   {
++      stat = SANE_STATUS_CANCELLED;
++      goto bugout;
++   }
++
++   if (ret & (IP_INPUT_ERROR | IP_FATAL_ERROR))
+    {
+       BUG("ipConvert error=%x\n", ret);
++      stat = io_status;
+       goto bugout;
+    }
+ 
+@@ -1139,13 +1301,14 @@
+ bugout:
+    if (stat != SANE_STATUS_GOOD)
+    {
++      *length = 0;
+       if (ps->ip_handle)
+       {
+          /* Note always call ipClose when SANE_STATUS_EOF, do not depend on sane_cancel because sane_cancel is only called at the end of a batch job. */ 
+          ipClose(ps->ip_handle);  
+          ps->ip_handle = 0;
+       } 
+-      ps->bb_end_page(ps, 0);
++      ps->bb_end_page(ps, stat != SANE_STATUS_EOF);
+    }
+ 
+    DBG8("-sane_hpaio_read() output=%p bytes_read=%d maxLength=%d status=%d\n", data, *length, maxLength, stat);
+@@ -1157,6 +1320,11 @@
+ {
+    struct soap_session *ps = (struct soap_session *)handle;
+ 
++#ifdef __APPLE__
++   /* scanimage may call this from SIGINT. Do not log, free, close IP state,
++    * or re-enter HPMUD here; read/start/close perform deferred cleanup. */
++   ps->user_cancel = 1;
++#else
+    DBG8("sane_hpaio_cancel()\n"); 
+ 
+    /*
+@@ -1170,5 +1338,5 @@
+       ps->ip_handle = 0;
+    }
+    ps->bb_end_scan(ps, 0);
++#endif
+ } /* soapht_cancel */
+-
+--- a/scan/sane/soaphti.h
++++ b/scan/sane/soaphti.h
+@@ -32,6 +32,10 @@
+ 
+ #ifndef _SOAPHTI_H
+ #define _SOAPHTI_H
++
++#ifdef __APPLE__
++#include <signal.h>
++#endif
+ 
+ #define SOAP_CONTRAST_MIN -1000 /*According the SOAP spec*/
+ #define SOAP_CONTRAST_MAX 1000
+@@ -151,7 +155,11 @@
+    int index;                    /* dime buffer index */
+    int cnt;                      /* dime buffer count */
+    unsigned char buf[65536];    /* dime buffer */ /*Setting to max 64K for dime buffer*/
++#ifdef __APPLE__
++   volatile sig_atomic_t user_cancel; /* Set by sane_cancel's signal-safe path. */
++#else
+    int user_cancel;
++#endif
+ 
+    void *hpmud_handle;         /* returned by dlopen */
+    void *math_handle;         /* returned by dlopen */

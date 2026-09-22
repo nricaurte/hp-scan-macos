@@ -1,0 +1,63 @@
+--- /tmp/hplip-original/hplip-3.25.8/scan/sane/soapht.c	2025-11-13 01:27:26
++++ /tmp/hplip-build/hplip-3.25.8/scan/sane/soapht.c	2026-09-19 16:31:18
+@@ -61,7 +61,22 @@
+ {
+    int stat=1;
+ 
+-   /* Load hpmud manually with symbols exported. Otherwise the plugin will not find it. */ 
++   /* Load hpmud manually with symbols exported. Otherwise the plugin will not find it. */
++#ifdef __APPLE__
++   if ((ps->hpmud_handle = load_library("libhpmud.0.dylib")) == NULL &&
++       (ps->hpmud_handle = load_library("/opt/homebrew/lib/libhpmud.0.dylib")) == NULL &&
++       (ps->hpmud_handle = load_library("libhpmud.dylib")) == NULL)
++   {
++      fprintf(stderr, "hpaio: unable to dlopen libhpmud on macOS\n");
++      goto bugout;
++   }
++   if ((ps->math_handle = load_library("libm.dylib")) == NULL &&
++       (ps->math_handle = load_library("/usr/lib/libm.dylib")) == NULL)
++   {
++      fprintf(stderr, "hpaio: unable to dlopen libm on macOS\n");
++      goto bugout;
++   }
++#else
+    if ((ps->hpmud_handle = load_library("libhpmud.so.0")) == NULL)
+    {
+ 	   if ((ps->hpmud_handle = load_library("libhpmud.so.0")) == NULL)
+@@ -73,13 +88,33 @@
+    {
+       if ((ps->math_handle = load_library("libm.so.6")) == NULL)
+          goto bugout;
+-   } 
++   }
++#endif
+ 
+-   if ((ps->bb_handle = load_plugin_library(UTILS_SCAN_PLUGIN_LIBRARY, so)) == NULL)
++#ifdef __APPLE__
++   ps->bb_handle = dlopen(
++       "/opt/homebrew/share/hplip/scan/plugins/bb_soapht.so",
++       RTLD_NOW | RTLD_GLOBAL
++   );
++
++   if (ps->bb_handle == NULL)
+    {
++      fprintf(stderr,
++              "hpaio SOAPHT: dlopen bb_soapht.so failed: %s\n",
++              dlerror());
++      goto bugout;
++   }
++
++   fprintf(stderr,
++           "hpaio SOAPHT: bb_soapht.so loaded successfully\n");
++#else
++   if ((ps->bb_handle =
++        load_plugin_library(UTILS_SCAN_PLUGIN_LIBRARY, so)) == NULL)
++   {
+       SendScanEvent(ps->uri, EVENT_PLUGIN_FAIL);
+       goto bugout;
+-   } 
++   }
++#endif
+ 
+    if ((ps->bb_open = get_library_symbol(ps->bb_handle, "bb_open")) == NULL)
+       goto bugout;

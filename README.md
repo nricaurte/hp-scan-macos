@@ -1,202 +1,292 @@
-# hplip-macos
+# hp-scan-macos-scan-type-5
 
-A working SANE scanner backend for HP USB-only inkjet/AIO printers on macOS,
-including Apple Silicon. Builds HPLIP's `hpaio` backend from source with the
-patches needed to compile and run on Darwin.
+macOS 26 Tahoe / Apple Silicon에서 **HP LaserJet Pro MFP M127fn**의 USB 스캔 기능을 복원하기 위한 HPLIP/SANE 기반 프로젝트입니다.
 
-![Image Capture discovering the bridged HP Smart Tank 500](docs/image-capture-discovered.png)
+이 저장소는 [`nricaurte/hp-scan-macos`](https://github.com/nricaurte/hp-scan-macos)를 기반으로 하며, 기존 프로젝트의 LEDM(`scan-type=7`) 지원에 더해 **SOAPHT 계열 `scan-type=5` 장치**를 macOS에서 사용할 수 있도록 확장합니다.
 
-*macOS Image Capture seeing the USB-only HP Smart Tank 500 as a network scanner under "Shared" via the bundled `airscan-bridge`.*
+현재 핵심 목표는 Linux용 HP proprietary plugin에 의존하지 않고, macOS용 native Mach-O SOAPHT compatibility plugin을 통해 M127fn을 동작시키는 것입니다.
 
-## Why this exists
+## 개발 배경
 
-HP doesn't ship a macOS scanner driver for low-end USB-only models like the
-**Smart Tank 500** (no Wi-Fi). HP Smart and HP Easy Scan both refuse to detect
-these printers, and Apple's built-in Image Capture / Preview need a vendor ICA
-driver that doesn't exist for them. The only working software on macOS is
-VueScan, which is paid.
+이 프로젝트는 제가 사용하던 **HP LaserJet Pro MFP M127fn**을 macOS Tahoe / Apple Silicon에서 다시 스캔에 활용하려는 시도에서 시작했습니다.
 
-HPLIP — HP's official open-source driver — is GPL-licensed and supports these
-printers fine, but it's Linux-only. This repo packages the Darwin port of
-HPLIP's scanner backend so you get the same free scanning macOS users already
-take for granted on Wi-Fi-capable HP models.
+처음에는 [HPScanner4MacOS](https://github.com/herb2k/HPScanner4MacOS)의 안내를 참고했습니다. HP 5.1.1 Printer Software Update를 최신 macOS에 우회 설치하고, Image Capture Support Apps를 추가한 뒤, 여러 드라이버를 시도해 맞는 것을 선택하면 이미지 캡처에서 스캐너를 사용할 수 있다는 방법이었습니다. 하지만 제 환경에서는 이 과정으로 정상 동작을 얻지 못했습니다.
 
-## Tested
+이후 [hp-printer-fix-macos](https://github.com/pavelbinar/hp-printer-fix-macos)의 `HewlettPackardPrinterDrivers.pkg` 수정 방법과, 이미 수정된 패키지를 제공하는 [HewlettPackardPrinterDrivers-MacOS](https://github.com/gabrielllzs/HewlettPackardPrinterDrivers-MacOS)도 찾아보았습니다. 두 프로젝트가 설명하는 수정은 드라이버 자체의 변경이나 재서명이 아니라, 설치 프로그램의 `Distribution` 파일에서 macOS 버전 제한을 해제하는 것입니다. 다만 기존 HP 스캐너 지원 앱을 Apple Silicon에서 사용하는 경로에는 Rosetta 2가 필요하다는 안내가 있어, 이 방법은 더 진행하지 않았습니다.
 
-| Component | Confirmed working |
+그러던 중 ChatGPT의 도움으로 [nricaurte/hp-scan-macos](https://github.com/nricaurte/hp-scan-macos)의 HPLIP/SANE 기반 접근을 알게 되었습니다. 당시 이 프로젝트는 LEDM(`scan-type=7`) 장치를 대상으로 하고 있었고, 제가 가진 M127fn은 SOAPHT(`scan-type=5`) 장치여서 추가 구현이 필요했습니다.
+
+이를 출발점으로 M127fn 실기기에서 직접 스캔과 통신 실험을 반복하며, SOAPHT 동작을 클린룸 방식으로 재구현한 **macOS arm64 네이티브 호환 플러그인**을 개발했습니다. 이 저장소는 그 구현과 검증 과정을 담고 있으며, Rosetta 2에 의존하지 않는 스캔 경로를 만드는 것이 개발 방향입니다.
+
+## 현재 확인된 환경
+
+| 항목 | 상태 |
 |---|---|
-| macOS 26 (Tahoe), arm64 (Apple Silicon) | ✅ |
+| macOS 26 Tahoe | ✅ |
+| Apple Silicon / arm64 | ✅ |
 | HPLIP 3.25.8 | ✅ |
-| Homebrew `sane-backends` 1.4.0, `libusb` 1.0.29, `go` 1.26+ | ✅ |
-| **HP Smart Tank 500 series (USB-only)** | ✅ |
+| Homebrew SANE 1.4.x | ✅ |
+| libusb | ✅ |
+| HP LaserJet Pro MFP M127fn USB | ✅ |
+| `scan-type=5` / SOAPHT | ✅ |
+| Flatbed Gray 150 dpi | ✅ |
+| Flatbed Gray 300 dpi | ✅ |
+| Flatbed Gray 600 dpi | ✅ |
+| Flatbed Color 300 dpi | ✅ |
+| Flatbed Color 600 dpi | ✅ |
+| ADF simplex Gray 150/300, Color 300 | ✅ |
+| ADF multi-page / PaperInADF debounce | ✅ |
+| Geometry / crop / offset | ✅ |
+| hp-scan presets / multi-page PDF | ✅ |
+| Apple Image Capture 직접 연동 | M127fn Flatbed·ADF 2페이지 JPEG/PDF 검증 |
+| Apple Preview 직접 연동 | M127fn Flatbed·취소 후 재시작 검증 |
 
-That's the only model verified end-to-end so far. The rest of the table is what
-*should* work given how the patches are written, but **untested — please open an
-issue with your model if you try one**.
+테스트 장치:
 
-### Models that should work without further changes
+```text
+HP LaserJet Pro MFP M127fn
+USB VID:PID 03f0:322a
+HPLIP scan-type=5
+Protocol: SOAPHT
+```
 
-Any HP printer that HPLIP marks as `scan-type=7` (LEDM) and is USB-only or
-USB-attached. That includes (verify by greping `data/models/models.dat` in the
-HPLIP source for `scan-type=7`):
+## 왜 이 프로젝트가 필요한가
 
-- HP Smart Tank 500 series ← tested
-- HP Smart Tank 510, 530, 550, 570, 580 series (USB variants)
-- HP Deskjet 2700, 2300, 4100 series (USB)
-- HP Envy 6000, 6020, 6030, 6400 series (USB-attached)
-- HP DeskJet Ink Advantage 2300, 2700, 6400 series
-- HP OfficeJet 3830, 4650, 5200 series (USB)
-- HP LaserJet MFP M28w, M139w, M140 series (USB)
+M127fn은 HPLIP에서 스캐너로 인식되지만, Linux 환경에서는 SOAPHT 스캔 처리를 위해 HP binary plugin을 사용합니다. 해당 Linux plugin은 macOS에서 직접 사용할 수 없습니다.
 
-### Models that probably need extra patches
+원본 plugin의 외부 의존성을 분석한 결과 핵심 통신은 HPLIP의 `hpmud` 채널 API를 통해 이루어지며, 주요 채널은 다음과 같습니다.
 
-- Anything with `scan-type=4` or `8` (Marvell) — different USB scan protocol;
-  the macOS device-id workaround in `02-musb-macos.patch` may need adapting.
-- Anything that requires HPLIP's binary plugin (`hp-plugin`) — the build
-  script will tell you if your model needs one. Smart Tank 500 doesn't.
-- Anything with Wi-Fi where you'd rather just use AirPrint scan natively —
-  if your printer already shows up in Image Capture without this repo, you
-  don't need any of this.
+```text
+HP-SOAP-SCAN
+```
 
-### Will likely **not** work
+실제 장치 트래픽 분석을 통해 다음 흐름을 확인했습니다.
 
-- Older parallel-port HPs (we disable `--enable-pp-build`).
-- HPs that use proprietary closed protocols (some old DesignJet plotters).
-- Anything connected over network where AirScan/IPP is already supposed to work
-  but doesn't — that's a different problem (firmware/Bonjour, not driver).
+```text
+GetScannerElements
+        ↓
+CreateScanJob
+        ↓
+RetrieveImage
+        ↓
+DIME records
+        ↓
+JPEG image
+        ↓
+CancelJob
+```
 
-## Install
+이 프로젝트는 이 동작을 clean-room 방식으로 재구현한 macOS arm64 plugin을 포함합니다.
+
+## 저장소 구조
+
+```text
+hp-scan-macos-scan-type-5/
+├── README.md
+├── readme.en.md
+├── prompt.md
+├── prompt.en.md
+├── build.sh
+├── LICENSE
+├── soapht-macos/
+│   ├── bb_soapht_macos.c
+│   └── build-plugin.sh
+├── patches/
+│   ├── 01-darwin-headers.patch
+│   ├── 02-musb-macos.patch
+│   ├── 03-hpaio-uninit-fix.patch
+│   └── 04-soapht-macos-plugin.patch
+├── stubs/
+├── bin/
+├── app/
+├── airscan-bridge/
+└── docs/
+    ├── ARCHITECTURE.md
+    ├── BUILD_AND_TEST.md
+    ├── RESEARCH_HISTORY.md
+    ├── TROUBLESHOOTING.md
+    └── ROADMAP.md
+```
+
+## 설치
 
 ```bash
-git clone https://github.com/nricaurte/hp-scan-macos.git
-cd hp-scan-macos
+git clone https://github.com/kimdongup/hp-scan-macos-scan-type-5.git
+cd hp-scan-macos-scan-type-5
 ./build.sh
 ```
 
-Build downloads HPLIP source from SourceForge (~30 MB), applies patches,
-compiles to `/opt/homebrew/lib/sane/libsane-hpaio.1.so`, registers `hpaio`
-in `/opt/homebrew/etc/sane.d/dll.conf`, and installs `hp-scan` wrapper.
+`build.sh`는 HPLIP 3.25.8 다운로드, Darwin patch 적용, `libhpmud`/`libhpip`/`libsane-hpaio` 빌드, native `bb_soapht.so` 빌드 및 설치, SANE backend 등록까지 수행합니다.
 
-If you don't use Homebrew at the default location, set `PREFIX=/your/path`.
+## 장치 확인
 
-## Install with Claude Code
-
-If you have [Claude Code](https://claude.com/claude-code) installed, you can
-let it do the whole thing. Open a terminal in any directory you don't mind a
-clone landing in, run `claude`, and paste:
-
-> Install the HP scanner backend from `https://github.com/nricaurte/hp-scan-macos`
-> for my HP Smart Tank 500 (USB). Clone it, read the README, run `./build.sh`,
-> then run `scanimage -L` to confirm the printer appears, and finally test a
-> scan with `hp-scan ~/Desktop/test.pdf 200`. The build needs `brew`, `gcc`,
-> `make`, `libusb`, and `sane-backends` — install anything missing.
-
-Claude will clone the repo, install Homebrew prerequisites, run the build,
-and verify scanning works end-to-end. Approve any `Bash` permission prompts
-as they come up. Replace "Smart Tank 500" with whatever HP USB printer you
-have — the same backend handles every LEDM-over-USB model.
-
-If something fails mid-build, paste the error back to Claude — the patches
-in this repo are narrow, but other LEDM models may need an additional
-quirk. Most failures are header/include issues fixable in one or two
-edits.
-
-## Use
-
-**CLI:**
 ```bash
-scanimage -L                                      # should list your HP
-hp-scan                                           # scan to ~/Desktop/scan-<date>.pdf at 300 DPI color
-hp-scan ~/Desktop/contract.pdf 300 gray           # custom path / DPI / mode
-scanimage -d hpaio:/usb/Smart_Tank_500_series?serial=XXX --resolution 600 -o foo.jpg
+scanimage -L
 ```
 
-**GUI (HP Scan.app):**
-The build also installs a clickable `HP Scan.app` into `~/Applications/`. Double-click,
-pick DPI (100/150/200/300/600/1200), pick mode (Color/Gray), pick a save path, scan.
-The PDF opens in Preview automatically. Find it in Spotlight as "HP Scan".
+정상 예:
 
-**Image Capture / Preview / Notes / iPhone-iPad (via airscan-bridge):**
-The build also installs a small Go service (`airscan-bridge`) that advertises
-the scanner over Bonjour as an AirScan/eSCL network device on the loopback
-interface. Apple's native scan stack (`Image Capture.app`, Preview's
-*Import from Scanner*, Notes' document scan, iOS Files / Notes scan over
-local network) all use AirScan, so the printer shows up under **Shared** in
-Image Capture as `Smart Tank 500 series (USB-bridge)` without any ICA driver.
-
-Run it ad-hoc:
-```bash
-airscan-bridge &
-```
-Or persist across reboots with the bundled LaunchAgent:
-```bash
-cp airscan-bridge/com.nricaurte.hp-airscan.plist ~/Library/LaunchAgents/
-launchctl load -w ~/Library/LaunchAgents/com.nricaurte.hp-airscan.plist
+```text
+device `hpaio:/usb/HP_LaserJet_Pro_MFP_M127fn?serial=XXXXXXXXXXXX' is a Hewlett-Packard HP_LaserJet_Pro_MFP_M127fn all-in-one
 ```
 
-> **Why all these layers?** macOS's native scan apps use Apple's **ICA**
-> framework, which requires a vendor driver in `/Library/Image Capture/Devices/`.
-> HPLIP/hpaio is a **SANE** backend — a parallel, Unix-style stack — so it
-> doesn't show up in those apps directly. AirScan/eSCL is the third stack
-> Apple uses for network scanners; we expose hpaio as an eSCL endpoint on
-> localhost and Bonjour does the rest. End result: scanning works in every
-> Apple scan app *except* HP Easy Scan, which is HP's own closed app and
-> only trusts HP's own discovery channel.
+## 지원 옵션 확인
 
-Any SANE-compatible frontend (VueScan, XSane via XQuartz, etc.) will also
-see the device through the SANE side once `hpaio` is registered.
+```bash
+scanimage -d 'hpaio:/usb/HP_LaserJet_Pro_MFP_M127fn?serial=YOUR_SERIAL' --all-options
+```
 
-## What the patches change
+현재 주요 옵션:
 
-| File | Patch | Reason |
-|------|-------|--------|
-| `scan/sane/orblitei.h` | replaced with stub (`stubs/orblitei.h`) | Linux header pulled in `OrbliteScan/MacCommon.h`, which `#include`s `<CoreFoundation/CFPlugInCOM.h>`. CFPlugInCOM defines `ULONG = UInt32` (32-bit), conflicting with HPLIP's `hpip.h` which defines `ULONG = unsigned long` (64-bit on arm64). Stub provides only what `hpaio.c` references. |
-| `scan/sane/orblite.c`  | replaced with stub (`stubs/orblite.c`) | Original implementation was a CFPlugIn for OS X 10.4-era macOS. We don't need orblite (Smart Tank uses LEDM, not orblite). Stub satisfies the linker. |
-| `scan/sane/bb_ledm.c`, `http.c`, `sclpml.c` | `03-darwin-headers.patch` | Adds `<unistd.h>` / `<sys/time.h>` for `usleep`/`gettimeofday`; on Linux these were dragged in transitively by `<syslog.h>`, on macOS they're not. |
-| `io/hpmud/musb.c` | `04-musb-macos.patch` | Two fixes: (1) some HP firmwares STALL on the IEEE 1284 `GET_DEVICE_ID` USB control transfer — synthesize a valid response on `LIBUSB_ERROR_PIPE` so the rest of hpmud accepts the device. The model info is already known from `iProduct` string descriptor read earlier. (2) `musb_probe_devices` had `if (!hd) libusb_close(hd)` (closing on NULL on success path) — flipped to `if (hd)`. |
-| `scan/sane/hpaio.c` | `05-hpaio-uninit-fix.patch` | `sane_hpaio_get_devices` calls `orblite_get_devices(devList, ...)` with `devList` being an uninitialized `SANE_Device***`. On Linux, the orblite path is rarely entered so the bug is latent; on macOS our stub dereferences the pointer and segfaults. Skip the call on Apple. |
+```text
+--mode Gray|Color
+--resolution 150|300|600dpi
+--source Flatbed|ADF
+--compression None|JPEG
+```
 
-The `Makefile` is also patched at build time (in `build.sh`) to:
-- set `hplip_confdir = $PREFIX/etc/hp` instead of `/etc/hp` (so install doesn't need sudo);
-- drop `libhpipp.la` from `libsane-hpaio.la` link deps (it's an empty archive when network/IPP build is disabled, and `ar cr` errors on empty archives on macOS).
+## 실제 스캔
 
-## Troubleshooting
+### 300 dpi Gray
 
-If you got here from a search engine, here are the literal symptoms this repo fixes:
+```bash
+scanimage   -d 'hpaio:/usb/HP_LaserJet_Pro_MFP_M127fn?serial=YOUR_SERIAL'   --resolution 300   --mode Gray   --source Flatbed   --format=jpeg   > ~/Desktop/m127-gray-300.jpg
+```
 
-- **"HP Smart Tank 500 not detected as scanner on macOS"** → install this.
-- **"HP Smart isn't finding my printer Mac"** → HP Smart needs Wi-Fi, your model is USB. Install this.
-- **"Image Capture doesn't see HP USB printer"** → Apple ICA stack has no driver for your model. Install this + run `airscan-bridge`.
-- **"Preview Import from Scanner missing on Mac"** → No driver in `/Library/Image Capture/Devices/`. Install this + run `airscan-bridge`.
-- **"HP Easy Scan: select your scanner / no scanner found"** → HP Easy Scan filters by HP's closed channel, won't see this driver. Use Image Capture or Preview instead, both work via `airscan-bridge`.
-- **"HP scanner support drop macOS Sonoma / Sequoia / Tahoe"** → Apple deprecating CUPS drivers and ICA. AirScan/eSCL is the surviving path; this repo bridges it.
-- **"VueScan is paid, HP Smart doesn't work, what now"** → this. Free, GPL, no watermark.
-- **`scanimage: no SANE devices found`** → SANE backend not registered. Run `./build.sh` or check `/opt/homebrew/etc/sane.d/dll.conf` contains `hpaio`.
-- **`hpaio: ledm get_device_id failed: LIBUSB_ERROR_PIPE`** → known Smart Tank firmware quirk. The patch in `02-musb-macos.patch` synthesizes a fake IEEE 1284 device id to work around it. If you see this AFTER applying patches, your model has a different quirk — open an issue.
-- **`Error during device I/O`** → USB interface is being held by another process. Common culprits: VueScan trial running in background, HP Smart, an existing CUPS print job. Quit those and retry.
-- **`No IPP over USB devices found`** (from `ipp-usb`) — that tool is unrelated to this repo; this repo specifically handles printers that *don't* speak IPP-over-USB.
+### 300 dpi Color
 
-## Caveats / known issues
+```bash
+scanimage   -d 'hpaio:/usb/HP_LaserJet_Pro_MFP_M127fn?serial=YOUR_SERIAL'   --resolution 300   --mode Color   --source Flatbed   --format=jpeg   > ~/Desktop/m127-color-300.jpg
+```
 
-- **Print queue conflict**: macOS's CUPS driver claims the USB printer interface for printing. Scanning works because `hpaio` claims a different interface (7/1/2) for control. If you hit `LIBUSB_ERROR_BUSY`, pause the print queue: `cupsdisable HP_<your_model>`, scan, then `cupsenable`.
-- **No ADF**: the Smart Tank 500 has only a flatbed, so the wrapper assumes single-page. For ADF models, `scanimage --batch` works.
-- **Resolution limits**: Smart Tank 500 supports 100/150/200/300/600/1200 DPI. Other LEDM models may differ.
-- **Plugin firmware**: HPLIP's `hp-plugin` (which fetches a binary blob for some printer models) is not packaged here. Smart Tank 500 doesn't need it. If your model does, you'll need to install the plugin manually — the build script will tell you.
-- **Not Notarized**: this is unsigned community code. macOS will let you run it because it's invoked from your shell, but Apple Silicon Macs won't load it as a system extension.
+## ADF 배치 PDF와 v0.4 검증
+
+```bash
+hp-scan --source ADF --resolution 300 --mode Color \
+  --page-size A4 --batch ~/Desktop/document.pdf
+```
+
+ADF는 150/300 dpi simplex를 지원합니다. Flatbed는 Gray 150/300/600,
+Color 300/600 dpi에서 확인되었습니다. `--page-size`는 A4, Letter, Legal을
+받으며 Legal은 ADF 전용입니다. Legal 요청은 전체 355.6 mm 높이로 전달합니다.
+
+```bash
+# 기존 설치본을 유지하며 별도 디렉터리에 빌드
+WORK="$(mktemp -d /tmp/hplip-v04.XXXXXX)" INSTALL=0 ./build.sh
+# 장치 없이 parser/transport/ADF lifecycle 오류 주입 검사
+HPLIP_SRC=/tmp/hplip-build/hplip-3.25.8 bash tests/run.sh
+```
+
+일반 로그는 기본적으로 조용하며 `SANE_DEBUG_HPAIO=8`로 추적할 수 있습니다.
+[Build & Test](docs/BUILD_AND_TEST.md)에 새 빌드만 선택해 실기기를 검사하는
+방법과 [Troubleshooting](docs/TROUBLESHOOTING.md)에 복구 동작을 정리했습니다.
+
+## SOAPHT plugin
+
+소스:
+
+```text
+soapht-macos/bb_soapht_macos.c
+```
+
+설치 위치:
+
+```text
+/opt/homebrew/share/hplip/scan/plugins/bb_soapht.so
+```
+
+plugin은 다음 HPLIP symbols를 runtime에 사용합니다.
+
+```text
+hpmud_open_channel
+hpmud_read_channel
+hpmud_write_channel
+hpmud_close_channel
+```
+
+## HPLIP runtime configuration
+
+```text
+/opt/homebrew/etc/hp/hplip.conf
+```
+
+확인:
+
+```bash
+strings /opt/homebrew/lib/libhpmud.0.dylib | grep hplip.conf
+```
+
+## 문서
+
+- [Architecture](docs/ARCHITECTURE.md)
+- [Build & Test](docs/BUILD_AND_TEST.md)
+- [Research History](docs/RESEARCH_HISTORY.md)
+- [Troubleshooting](docs/TROUBLESHOOTING.md)
+- [Roadmap](docs/ROADMAP.md)
+- [Development Prompt / Korean](prompt.md)
+- [Development Prompt / English](prompt.en.md)
+
+## Upstream
+
+```text
+https://github.com/nricaurte/hp-scan-macos
+```
+
+권장 Git remote 구성:
+
+```text
+origin   → https://github.com/kimdongup/hp-scan-macos-scan-type-5.git
+upstream → https://github.com/nricaurte/hp-scan-macos.git
+```
+
+## Project status
+
+현재 **HP LaserJet Pro MFP M127fn USB Flatbed SOAPHT scanning on macOS Tahoe / Apple Silicon**은 동작 검증되었습니다.
+
+ADF simplex, 다중 페이지, PaperInADF debounce, geometry/crop/offset, page-size preset과 PDF wrapper도 구현되어 있습니다.
+
+v0.4에서는 로그 정리, 실패 경로 정리, 트랜잭션 timeout, busy/cancel 상태 전달 및 복구, 설치 없는 clean build와 모의 통신 회귀 검사를 추가했습니다. macOS 취소 콜백은 신호 안전한 플래그만 설정하고 정리는 읽기/다음 시작/닫기 시점에 수행합니다. USB 응답은 1초 단위로 읽으며 분리 오류를 I/O error로 전달합니다. 명시적인 `MediaJam` 상태는 `JAMMED`로 전달하며, 손상된 ADF 이미지 응답 뒤에는 장치 상태를 한 번 확인합니다. 취소 시 이미 시작한 SOAP 응답은 끝까지 받아 다음 요청과 섞이지 않게 하므로, 현재 원고 취득이 끝날 때까지 취소 반환이 지연될 수 있습니다. 실기기 검증 결과는 [v0.4 검증 기록](docs/V0.4_VALIDATION.md)을 참고하십시오.
+
+ADF Legal 요청을 A4 수준으로 줄이던 보정은 제거했습니다. ADF 선택 시 기본 높이는 기존 약 296.9 mm이며, 명시적 Legal 요청은 355.6 mm를 유지합니다. Flatbed 동작은 변경하지 않았습니다. SOAP 요청 및 SANE 옵션 회귀 검사는 통과했으며, 실제 Legal 원고의 하단까지 캡처하는 실기기 검증은 별도입니다.
 
 ## License
 
-GPL-2.0-or-later, matching HPLIP. The patches and the build script in this
-repo are derivative of HPLIP source and inherit its license. See `LICENSE`.
+원본 HPLIP 및 upstream 프로젝트의 라이선스를 따릅니다. HPLIP-derived patch 및 integration code를 배포할 때에는 upstream license 조건을 확인하십시오.
 
-HPLIP itself is Copyright © Hewlett-Packard Development Company, L.P. and is
-distributed under GPL-2.0/MIT/BSD (mixed by file). This repo does NOT bundle
-HPLIP source — `build.sh` downloads it directly from the official SourceForge
-mirror at build time.
 
-## Credits
+## scan-type=5 모델 호환성 확장
 
-- HP for releasing HPLIP under GPL.
-- The OpenPrinting / SANE project for `sane-backends`.
-- The `libusb` developers for cross-platform USB.
-- Built by porting HPLIP 3.25.8 to macOS 26 in a single Claude Code session.
+M127fn 고정 capability를 제거하고 `GetScannerElements`의 급지 방식, 최소/최대
+크기, 광학 해상도, 색상 및 JFIF 지원을 읽도록 확장했습니다. Flatbed 전용과
+ADF 전용 장치도 구분하며, namespace가 있는 XML 응답도 처리합니다. M127fn의
+기존 Flatbed geometry와 ADF 기본값/Legal 분리는 유지합니다.
+
+HPLIP 3.25.8에는 scan-type=5 모델 식별자 105개가 있습니다. 이들은 **호환성 후보**이며,
+실기기 기준은 여전히 M127fn입니다. 다른 모델의 동작을 검증 완료로 표시하지 않습니다.
+지원 범위·제한·신규 모델의 응답 수집 방법은 [호환성 안내](docs/COMPATIBILITY.md),
+전체 후보는 [모델 목록](docs/SOAPHT_MODELS.md)을 참고하십시오.
+여러 스캐너가 연결된 경우 `hp-scan --device 'hpaio:...' ...`로 선택할 수 있습니다.
+
+## macOS Image Capture / Preview
+
+LAN 연결에는 별도의 WSD 경로를 추가했습니다. USB 모드는 그대로 유지하며,
+`AIRSCAN_WSD_URL`을 지정하면 WSD → 로컬 AirScan 방식으로 연결합니다.
+M127fn에서 Image Capture의 Flatbed 스캔과 ADF 컬러 300dpi 2장 PDF·자동 종료를 확인했습니다.
+설치 방법과 실제 검증 범위는 [WSD 네트워크 스캔](docs/WSD_NETWORK.md)을 참고하십시오.
+
+로컬 AirScan/eSCL 브리지를 추가했습니다. 설치된 SOAPHT 장치의 실제 source·DPI·geometry를
+광고하고, ADF 여러 페이지를 한 SANE 작업으로 전달합니다. 서버와 Bonjour 등록은 이 Mac
+전용이며 LAN에는 공개하지 않습니다.
+
+M127fn에서 Image Capture의 Flatbed 및 ADF 2페이지 JPEG/PDF, Preview의 Flatbed와
+취소 후 재시작을 확인했습니다. ADF의 간헐적 장치 오류는 남아 있으며, 취소는 진행 중인
+장치 응답을 정리할 때까지 지연될 수 있습니다. 현재 설치본과 시험 후보의 구분은 아래
+검증 기록에 명시했습니다.
+
+```bash
+./airscan-bridge/build.sh
+./airscan-bridge/service.sh install
+```
+
+[설치·사용·제한](docs/AIRSCAN.md)과 [네이티브 앱 검증 기록](docs/AIRSCAN_VALIDATION.md)을
+참고하십시오. 다른 HP 모델의 동작은 실제 장치 검증 전까지 experimental입니다.

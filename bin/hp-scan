@@ -1,48 +1,535 @@
 #!/usr/bin/env bash
-# hp-scan — scan a single page from any HP printer detected by hpaio.
+
+# hp-scan — simple HP HPAIO scanner wrapper for macOS.
 #
-# Usage:
-#   hp-scan [output_path] [resolution_dpi] [color|gray]
+# New style:
+#   hp-scan [options] [output_path]
+#
+# Options:
+#   --source Flatbed|ADF
+#   --resolution 150|300|600
+#   --mode Gray|Color
+#   --page-size A4|Letter|Legal
+#   -h, --help
 #
 # Examples:
-#   hp-scan                                 # scans to ~/Desktop/scan-<date>.pdf at 300 DPI color
-#   hp-scan ~/Desktop/contract.pdf
+#   hp-scan
+#   hp-scan ~/Desktop/scan.pdf
+#
+#   hp-scan \
+#       --source ADF \
+#       --resolution 300 \
+#       --mode Gray \
+#       --page-size A4 \
+#       ~/Desktop/document.pdf
+#
+#   hp-scan \
+#       --source ADF \
+#       --page-size Legal \
+#       ~/Desktop/legal.pdf
+#
+# Legacy syntax is also supported:
+#   hp-scan [output_path] [resolution_dpi] [color|gray]
+#
 #   hp-scan ~/Desktop/photo.pdf 600 color
 #   hp-scan ~/Desktop/text.pdf 300 gray
 
 set -euo pipefail
 
-OUT="${1:-$HOME/Desktop/scan-$(date +%Y%m%d-%H%M%S).pdf}"
-RES="${2:-300}"
-MODE_INPUT="${3:-color}"
-case "$MODE_INPUT" in
-    gray|grey|Gray) SANE_MODE="Gray" ;;
-    *)              SANE_MODE="Color" ;;
+DEFAULT_OUT="$HOME/Desktop/scan-$(date +%Y%m%d-%H%M%S).pdf"
+
+OUT=""
+RES="300"
+MODE="Color"
+SOURCE="Flatbed"
+PAGE_SIZE=""
+BATCH=0
+DEV=""
+
+usage()
+{
+    cat <<'EOF'
+Usage:
+  hp-scan [options] [output_path]
+
+Options:
+  --device URI
+      Select an HPAIO scanner explicitly (default: first detected HPAIO device).
+
+  --source SOURCE
+      Flatbed or ADF
+      Default: Flatbed
+
+  --resolution DPI
+      150, 300, or 600
+      Note: ADF supports 150/300 on the M127fn.
+      Default: 300
+
+  --mode MODE
+      Gray or Color
+      Default: Color
+
+  --page-size SIZE
+      A4, Letter, or Legal
+
+      A4      210.0 x 297.0 mm
+      Letter  215.9 x 279.4 mm
+      Legal   215.9 x 355.6 mm
+
+  --batch
+      Scan all pages from the ADF into one PDF.
+      Requires --source ADF.
+
+  -h, --help
+      Show this help.
+
+Examples:
+  hp-scan
+
+  hp-scan ~/Desktop/test.pdf
+
+  hp-scan \
+    --source ADF \
+    --resolution 300 \
+    --mode Gray \
+    --page-size A4 \
+    --batch \
+    ~/Desktop/document.pdf
+
+Legacy:
+  hp-scan ~/Desktop/text.pdf 300 gray
+EOF
+}
+
+normalize_source()
+{
+    case "$1" in
+        Flatbed|flatbed|PLATEN|Platen|platen)
+            echo "Flatbed"
+            ;;
+        ADF|adf)
+            echo "ADF"
+            ;;
+        *)
+            echo "ERROR: unsupported source: $1" >&2
+            exit 2
+            ;;
+    esac
+}
+
+normalize_mode()
+{
+    case "$1" in
+        Gray|gray|grey|GRAY)
+            echo "Gray"
+            ;;
+        Color|color|colour|COLOR)
+            echo "Color"
+            ;;
+        *)
+            echo "ERROR: unsupported mode: $1" >&2
+            exit 2
+            ;;
+    esac
+}
+
+normalize_page_size()
+{
+    case "$1" in
+        A4|a4)
+            echo "A4"
+            ;;
+        Letter|letter|LETTER)
+            echo "Letter"
+            ;;
+        Legal|legal|LEGAL)
+            echo "Legal"
+            ;;
+        *)
+            echo "ERROR: unsupported page size: $1" >&2
+            exit 2
+            ;;
+    esac
+}
+
+merge_pdfs()
+{
+    local output="$1"
+    shift
+
+    local swift_script="$TMP/merge-pdfs.swift"
+
+    cat > "$swift_script" <<'SWIFT'
+import Foundation
+import PDFKit
+
+let args = CommandLine.arguments
+
+guard args.count >= 3 else {
+    fputs("merge-pdfs: insufficient arguments\n", stderr)
+    exit(1)
+}
+
+let outputPath = args[1]
+let result = PDFDocument()
+
+var outputPage = 0
+
+for inputPath in args.dropFirst(2) {
+    guard let document = PDFDocument(url: URL(fileURLWithPath: inputPath)) else {
+        fputs("merge-pdfs: cannot open \(inputPath)\n", stderr)
+        exit(1)
+    }
+
+    for index in 0..<document.pageCount {
+        if let page = document.page(at: index) {
+            result.insert(page, at: outputPage)
+            outputPage += 1
+        }
+    }
+}
+
+if !result.write(to: URL(fileURLWithPath: outputPath)) {
+    fputs("merge-pdfs: failed to write \(outputPath)\n", stderr)
+    exit(1)
+}
+SWIFT
+
+    xcrun swift "$swift_script" "$output" "$@"
+}
+
+#
+# Parse new-style options first.
+#
+POSITIONAL=()
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --source)
+            [[ $# -ge 2 ]] || {
+                echo "ERROR: --source requires a value." >&2
+                exit 2
+            }
+            SOURCE="$(normalize_source "$2")"
+            shift 2
+            ;;
+
+        --device)
+            if [[ $# -lt 2 || "$2" != hpaio:* ]]; then
+                echo "ERROR: --device requires an hpaio: URI." >&2
+                exit 2
+            fi
+            DEV="$2"
+            shift 2
+            ;;
+        --resolution)
+            [[ $# -ge 2 ]] || {
+                echo "ERROR: --resolution requires a value." >&2
+                exit 2
+            }
+            RES="$2"
+            shift 2
+            ;;
+
+        --mode)
+            [[ $# -ge 2 ]] || {
+                echo "ERROR: --mode requires a value." >&2
+                exit 2
+            }
+            MODE="$(normalize_mode "$2")"
+            shift 2
+            ;;
+
+        --page-size)
+            [[ $# -ge 2 ]] || {
+                echo "ERROR: --page-size requires a value." >&2
+                exit 2
+            }
+            PAGE_SIZE="$(normalize_page_size "$2")"
+            shift 2
+            ;;
+        --batch)
+            BATCH=1
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+
+        --)
+            shift
+            while [[ $# -gt 0 ]]; do
+                POSITIONAL+=("$1")
+                shift
+            done
+            ;;
+
+        -*)
+            echo "ERROR: unknown option: $1" >&2
+            echo
+            usage >&2
+            exit 2
+            ;;
+
+        *)
+            POSITIONAL+=("$1")
+            shift
+            ;;
+    esac
+done
+
+#
+# Backward-compatible positional arguments:
+#
+#   1: output
+#   2: resolution
+#   3: color|gray
+#
+if [[ ${#POSITIONAL[@]} -ge 1 ]]; then
+    OUT="${POSITIONAL[0]}"
+fi
+
+if [[ ${#POSITIONAL[@]} -ge 2 ]]; then
+    RES="${POSITIONAL[1]}"
+fi
+
+if [[ ${#POSITIONAL[@]} -ge 3 ]]; then
+    MODE="$(normalize_mode "${POSITIONAL[2]}")"
+fi
+
+if [[ ${#POSITIONAL[@]} -gt 3 ]]; then
+    echo "ERROR: too many positional arguments." >&2
+    exit 2
+fi
+
+OUT="${OUT:-$DEFAULT_OUT}"
+
+#
+# Validate resolution.
+#
+case "$RES" in
+    150|300|600)
+        ;;
+    *)
+        echo "ERROR: unsupported resolution: $RES" >&2
+        echo "Supported: 150, 300, 600" >&2
+        exit 2
+        ;;
 esac
 
-# Auto-detect first hpaio device.
-DEV=$(scanimage -L 2>/dev/null | awk -F"'" '/hpaio:/{print $2; exit}')
+# ??
+# batch
+#
+if [[ "$BATCH" -eq 1 && "$SOURCE" != "ADF" ]]; then
+    echo "ERROR: --batch currently requires --source ADF." >&2
+    exit 2
+fi
+
+if [[ "$BATCH" -eq 1 ]]; then
+    case "${OUT##*.}" in
+        pdf|PDF)
+            ;;
+        *)
+            echo "ERROR: --batch output must be a .pdf file." >&2
+            exit 2
+            ;;
+    esac
+fi
+#
+# ??
+#
+
+#
+# Convert page-size presets to SANE geometry in millimetres.
+#
+GEOMETRY=()
+
+case "$PAGE_SIZE" in
+    "")
+        # No explicit page size:
+        # use the backend's current default geometry.
+        ;;
+
+    A4)
+        GEOMETRY=(
+            -l 0
+            -t 0
+            -x 210
+            -y 297
+        )
+        ;;
+
+    Letter)
+        GEOMETRY=(
+            -l 0
+            -t 0
+            -x 215.9
+            -y 279.4
+        )
+        ;;
+
+    Legal)
+        GEOMETRY=(
+            -l 0
+            -t 0
+            -x 215.9
+            -y 355.6
+        )
+        ;;
+esac
+
+#
+# Auto-detect first HPAIO device.
+#
+if [[ -z "$DEV" ]]; then
+DEV="$(
+    scanimage -L 2>/dev/null |
+    sed -n "s/^device \`\([^']*\)'.*/\1/p" |
+    awk '/^hpaio:/ && !found++ {print}'
+)"
+fi
+
 if [[ -z "${DEV:-}" ]]; then
-    echo "✗ no HP scanner detected. Is the printer powered on and USB connected?"
-    echo "  run \`scanimage -L\` to debug."
+    echo "✗ no HP scanner detected."
+    echo "  Is the printer powered on and USB connected?"
+    echo "  Run 'scanimage -L' to debug."
     exit 1
 fi
 
-TMP=$(mktemp -d)
+# Previously these requests were rejected for every device using M127 limits.
+# Query only those cases; keep ordinary M127 scans and option ordering unchanged.
+if [[ ( "$SOURCE" == "ADF" && "$RES" == "600" ) ||
+      ( "$SOURCE" == "Flatbed" && "$PAGE_SIZE" == "Legal" ) ]]; then
+    OPTIONS="$(scanimage -d "$DEV" --source "$SOURCE" --format=jpeg -A)" || exit 1
+    if [[ "$SOURCE" == "ADF" && "$RES" == "600" ]]; then
+        ALLOWED="$(printf '%s\n' "$OPTIONS" | awk '$1 == "--resolution" {print $2; exit}')"
+        case "|${ALLOWED%dpi}|" in
+            *'|600|'*) ;;
+            *) echo "ERROR: this ADF does not advertise 600 dpi. Use a listed resolution." >&2; exit 2 ;;
+        esac
+    fi
+    if [[ "$SOURCE" == "Flatbed" && "$PAGE_SIZE" == "Legal" ]]; then
+        MAX_HEIGHT="$(printf '%s\n' "$OPTIONS" | awk '$1 == "-y" {v=$2; sub(/^.*\.\./,"",v); sub(/mm$/,"",v); print v; exit}')"
+        MAX_WIDTH="$(printf '%s\n' "$OPTIONS" | awk '$1 == "-x" {v=$2; sub(/^.*\.\./,"",v); sub(/mm$/,"",v); print v; exit}')"
+        if ! awk -v height="$MAX_HEIGHT" -v width="$MAX_WIDTH" 'BEGIN {exit !(height ~ /^[0-9]+([.][0-9]+)?$/ && width ~ /^[0-9]+([.][0-9]+)?$/ && height+0 >= 355.6 && width+0 >= 215.9)}'; then
+            echo "ERROR: this flatbed does not advertise Legal height. Use the ADF." >&2
+            exit 2
+        fi
+    fi
+fi
+
+TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
-echo "→ scanning on $DEV  (${RES} DPI, $SANE_MODE) ..."
-scanimage -d "$DEV" --resolution "$RES" --mode "$SANE_MODE" --format=jpeg \
-    -o "$TMP/page.jpg" 2>/dev/null
+JPEG="$TMP/page.jpg"
 
-if [[ ! -s "$TMP/page.jpg" ]]; then
-    echo "✗ scan produced no data."
-    exit 1
+echo "→ scanner:    $DEV"
+echo "→ source:     $SOURCE"
+echo "→ resolution: ${RES} dpi"
+echo "→ mode:       $MODE"
+
+if [[ -n "$PAGE_SIZE" ]]; then
+    echo "→ page size:  $PAGE_SIZE"
 fi
 
-# Convert to PDF using macOS's built-in sips.
-sips -s format pdf "$TMP/page.jpg" --out "$OUT" >/dev/null
+echo "→ scanning ..."
+
+SCAN_ARGS=(
+    -d "$DEV"
+    --source "$SOURCE"
+    --resolution "$RES"
+    --mode "$MODE"
+    --format=jpeg
+)
+
+if [[ ${#GEOMETRY[@]} -gt 0 ]]; then
+    SCAN_ARGS+=("${GEOMETRY[@]}")
+fi
+
+if [[ "$BATCH" -eq 1 ]]; then
+    echo "→ batch mode: scanning all ADF pages ..."
+
+    if scanimage \
+        "${SCAN_ARGS[@]}" \
+        --batch="$TMP/page-%03d.jpg"; then
+        :
+    else
+        scan_status=$?
+        # A later-page error must not delete pages already acquired. Keep the
+        # original failure status; do not publish an incomplete PDF as success.
+        trap - EXIT
+        echo "ERROR: batch failed (scanimage exit $scan_status)." >&2
+        echo "Retained scan files (possibly incomplete): $TMP" >&2
+        exit "$scan_status"
+    fi
+
+    shopt -s nullglob
+    JPEG_PAGES=("$TMP"/page-*.jpg)
+
+    if [[ ${#JPEG_PAGES[@]} -eq 0 ]]; then
+        echo "✗ no pages were scanned."
+        exit 1
+    fi
+
+    echo "→ scanned ${#JPEG_PAGES[@]} page(s)"
+else
+    JPEG="$TMP/page.jpg"
+
+    scanimage \
+        "${SCAN_ARGS[@]}" \
+        -o "$JPEG"
+
+    if [[ ! -s "$JPEG" ]]; then
+        echo "✗ scan produced no data."
+        exit 1
+    fi
+fi
+
+#
+# Output handling.
+#
+if [[ "$BATCH" -eq 1 ]]; then
+    echo "→ creating multi-page PDF ..."
+
+    PDF_PAGES=()
+
+    for jpg in "${JPEG_PAGES[@]}"; do
+        base="$(basename "$jpg" .jpg)"
+        pdf="$TMP/$base.pdf"
+
+        sips \
+            -s format pdf \
+            "$jpg" \
+            --out "$pdf" \
+            >/dev/null
+
+        PDF_PAGES+=("$pdf")
+    done
+
+    merge_pdfs "$OUT" "${PDF_PAGES[@]}"
+
+else
+    case "${OUT##*.}" in
+        jpg|JPG|jpeg|JPEG)
+            cp "$JPEG" "$OUT"
+            ;;
+
+        pdf|PDF)
+            sips \
+                -s format pdf \
+                "$JPEG" \
+                --out "$OUT" \
+                >/dev/null
+            ;;
+
+        *)
+            echo "ERROR: output extension must be .pdf, .jpg, or .jpeg" >&2
+            exit 2
+            ;;
+    esac
+fi
+
 echo "✔ saved: $OUT"
 
-# Open it for the user.
 [[ -t 1 ]] && open "$OUT" || true

@@ -1,0 +1,48 @@
+--- a/scan/sane/soapht.c
++++ b/scan/sane/soapht.c
+@@ -61,7 +61,22 @@
+ {
+    int stat=1;
+ 
+-   /* Load hpmud manually with symbols exported. Otherwise the plugin will not find it. */ 
++   /* Load hpmud manually with symbols exported. Otherwise the plugin will not find it. */
++#ifdef __APPLE__
++   if ((ps->hpmud_handle = load_library("libhpmud.0.dylib")) == NULL &&
++       (ps->hpmud_handle = load_library("/opt/homebrew/lib/libhpmud.0.dylib")) == NULL &&
++       (ps->hpmud_handle = load_library("libhpmud.dylib")) == NULL)
++   {
++      fprintf(stderr, "hpaio: unable to dlopen libhpmud on macOS\n");
++      goto bugout;
++   }
++   if ((ps->math_handle = load_library("libm.dylib")) == NULL &&
++       (ps->math_handle = load_library("/usr/lib/libm.dylib")) == NULL)
++   {
++      fprintf(stderr, "hpaio: unable to dlopen libm on macOS\n");
++      goto bugout;
++   }
++#else
+    if ((ps->hpmud_handle = load_library("libhpmud.so.0")) == NULL)
+    {
+ 	   if ((ps->hpmud_handle = load_library("libhpmud.so.0")) == NULL)
+@@ -73,11 +88,20 @@
+    {
+       if ((ps->math_handle = load_library("libm.so.6")) == NULL)
+          goto bugout;
+-   } 
++   }
++#endif
+ 
+    if ((ps->bb_handle = load_plugin_library(UTILS_SCAN_PLUGIN_LIBRARY, so)) == NULL)
+    {
+       SendScanEvent(ps->uri, EVENT_PLUGIN_FAIL);
++#ifdef __APPLE__
++      fprintf(stderr,
++         "hpaio: this HP scanner uses the SOAPHT protocol and needs HP's\n"
++         "proprietary plugin %s. That plugin ships as a Linux .so only,\n"
++         "so USB scan cannot work on macOS for this model.\n"
++         "This project supports LEDM USB inkjets (scan-type=7), e.g. Smart Tank 500.\n",
++         so);
++#endif
+       goto bugout;
+    } 
+ 

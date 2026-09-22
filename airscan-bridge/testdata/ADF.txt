@@ -1,0 +1,71 @@
+Usage: scanimage [OPTION]...
+
+Start image acquisition on a scanner device and write image data to
+standard output.
+
+Parameters are separated by a blank from single-character options (e.g.
+-d epson) and by a "=" from multi-character options (e.g. --device-name=epson).
+-d, --device-name=DEVICE   use a given scanner device (e.g. hp:/dev/scanner)
+    --format=pnm|tiff|png|jpeg|pdf  file format of output file
+-i, --icc-profile=PROFILE  include this ICC profile into TIFF file
+-L, --list-devices         show available scanner devices
+-f, --formatted-device-list=FORMAT similar to -L, but the FORMAT of the output
+                           can be specified: %d (device name), %v (vendor),
+                           %m (model), %t (type), %i (index number), and
+                           %n (newline)
+-b, --batch[=FORMAT]       working in batch mode, FORMAT is `out%d.pnm' `out%d.tif'
+                           `out%d.png' or `out%d.jpg' by default depending on --format
+                           This option is incompatible with --output-file.
+    --batch-start=#        page number to start naming files with
+    --batch-count=#        how many pages to scan in batch mode
+    --batch-increment=#    increase page number in filename by #
+    --batch-double         increment page number by two, same as
+                           --batch-increment=2
+    --batch-print          print image filenames to stdout
+    --batch-prompt         ask for pressing a key before scanning a page
+    --accept-md5-only      only accept authorization requests using md5
+-p, --progress             print progress messages
+-o, --output-file=PATH     save output to the given file instead of stdout.
+                           This option is incompatible with --batch.
+-n, --dont-scan            only set options, don't actually scan
+-T, --test                 test backend thoroughly
+-A, --all-options          list all available backend options
+-h, --help                 display this help message and exit
+-v, --verbose              give even more status messages
+-B, --buffer-size=#        change input buffer size (in kB, default 32)
+-V, --version              print version information
+
+Options specific to device `hpaio:/usb/HP_LaserJet_Pro_MFP_M127fn?serial=REDACTED':
+  Scan mode:
+    --mode Gray|Color [Gray]
+        Selects the scan mode (e.g., lineart, monochrome, or color).
+    --resolution 150|300dpi [300]
+        Sets the resolution of the scanned image.
+    --source Flatbed|ADF [ADF]
+        Selects the scan source (such as a document-feeder).
+  Advanced:
+    --brightness -1000..1000 [0] [advanced]
+        Controls the brightness of the acquired image.
+    --contrast -1000..1000 [0] [advanced]
+        Controls the contrast of the acquired image.
+    --compression JPEG [JPEG] [advanced]
+        Selects the scanner compression method for faster scans, possibly at
+        the expense of image quality.
+    --jpeg-quality 0..100 [10] [advanced]
+        Sets the scanner JPEG compression factor. Larger numbers mean better
+        compression, and smaller numbers mean better image quality.
+  Geometry:
+    -l 0..215.9mm [0]
+        Top-left x position of scan area.
+    -t 0..355.6mm [0]
+        Top-left y position of scan area.
+    -x 0..215.9mm [215.9]
+        Width of scan-area.
+    -y 0..355.6mm [296.901]
+        Height of scan-area.
+
+Type ``scanimage --help -d DEVICE'' to get list of all options for DEVICE.
+
+List of available devices:
+    hpaio:/usb/HP_LaserJet_Pro_MFP_M127fn?serial=REDACTED
+Output format is not set, using pnm as a default.

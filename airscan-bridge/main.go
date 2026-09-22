@@ -1,489 +1,770 @@
-// airscan-bridge: a tiny eSCL/AirScan front-end that translates network
-// scan requests from macOS apps (Image Capture, Preview, HP Easy Scan,
-// iPhone/iPad scan) into local `scanimage` invocations against a SANE
-// backend on the same Mac.
-//
-// Apple's native scan stack uses ICA, which only sees scanners exposed
-// by vendor drivers in /Library/Image Capture/Devices/. AirScan/eSCL is
-// the parallel network-scan path, and Image Capture treats any host
-// advertising _uscan._tcp on the LAN as a real scanner. By advertising
-// ourselves on the loopback interface, we appear in every Apple scan
-// app without needing an ICA driver.
-
+// Local eSCL bridge. One scanimage process owns each complete SANE batch.
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/xml"
 	"errors"
 	"fmt"
+	"image/jpeg"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
-	"regexp"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 )
 
-// -------- scanner detection (via SANE) --------
-
-var deviceURI string
-
-func detectDevice() string {
-	if v := os.Getenv("AIRSCAN_DEVICE"); v != "" {
-		return v
-	}
-	out, err := exec.Command("scanimage", "-L").Output()
-	if err != nil {
-		return ""
-	}
-	re := regexp.MustCompile("device [`']([^`']+)[`']")
-	if m := re.FindStringSubmatch(string(out)); len(m) >= 2 {
-		return m[1]
-	}
-	return ""
-}
-
-func deviceModel(uri string) string {
-	// hpaio:/usb/Smart_Tank_500_series?serial=... -> "Smart Tank 500 series"
-	re := regexp.MustCompile(`/usb/([^?]+)`)
-	m := re.FindStringSubmatch(uri)
-	if len(m) < 2 {
-		return "Bridged Scanner"
-	}
-	return strings.ReplaceAll(m[1], "_", " ")
-}
-
-// -------- jobs --------
-
 type Job struct {
-	ID         string
-	State      string // Pending, Processing, Completed, Aborted, Canceled
-	Settings   ScanSettings
-	Started    time.Time
-	dataReader io.ReadCloser
-	scanCmd    *exec.Cmd
-	once       sync.Once
+	ErrorHTTP                  int
+	ID, Dir, State, Reason     string
+	Failure                    string
+	RecoveryState, RecoveryADF string
+	Settings                   ScanSettings
+	Started, Touched           time.Time
+	Pages                      []string
+	Sent                       int
+	Done, Reading              bool
+	Deleted                    bool
+	Cmd                        *exec.Cmd
+	Changed                    chan struct{}
+	Cancel                     chan struct{}
+	CancelOnce                 sync.Once
+}
+type Bridge struct {
+	mu                     sync.Mutex
+	Device                 Device
+	WSD                    *WSDClient
+	Scanimage, Probe       string
+	Jobs                   map[string]*Job
+	Active                 *Job
+	Seq                    uint64
+	ReadyAfter             time.Time
+	Settle                 time.Duration
+	AdfState, ScannerState string
+	LastProbe              time.Time
+	Closed                 bool
 }
 
-type ScanSettings struct {
-	XMLName        xml.Name `xml:"ScanSettings"`
-	Version        string   `xml:"Version"`
-	ColorMode      string   `xml:"ColorMode"`
-	DocumentFormat string   `xml:"DocumentFormat"`
-	XResolution    int      `xml:"XResolution"`
-	YResolution    int      `xml:"YResolution"`
-	InputSource    string   `xml:"InputSource"`
+func newBridge(d Device, scanimage, probe string) *Bridge {
+	return &Bridge{Device: d, Scanimage: scanimage, Probe: probe, Jobs: make(map[string]*Job), Settle: 12 * time.Second, AdfState: "ScannerAdfUnknown", ScannerState: "Idle"}
 }
-
-var (
-	jobs   sync.Map // jobID -> *Job
-	jobSeq int64
-)
-
-// -------- handlers --------
-
-func handleCapabilities(w http.ResponseWriter, r *http.Request) {
+func (b *Bridge) notify(j *Job) { close(j.Changed); j.Changed = make(chan struct{}) }
+func (b *Bridge) cancel(j *Job) {
+	j.CancelOnce.Do(func() { close(j.Cancel); j.State = "Canceled"; j.Reason = "JobCanceledByUser"; b.notify(j) })
+}
+func (b *Bridge) jobInfo(j *Job) string {
+	return fmt.Sprintf(`<scan:JobInfo><pwg:JobUri>/eSCL/ScanJobs/%s</pwg:JobUri><pwg:JobUuid>%s</pwg:JobUuid><scan:Age>%d</scan:Age><pwg:ImagesToTransfer>%d</pwg:ImagesToTransfer><pwg:ImagesCompleted>%d</pwg:ImagesCompleted><pwg:JobState>%s</pwg:JobState><pwg:JobStateReasons><pwg:JobStateReason>%s</pwg:JobStateReason></pwg:JobStateReasons></scan:JobInfo>`, j.ID, stableUUID(j.ID), int(time.Since(j.Started).Seconds()), len(j.Pages)-j.Sent, len(j.Pages), j.State, j.Reason)
+}
+func xmlResponse(w http.ResponseWriter, s string) {
 	w.Header().Set("Content-Type", "text/xml; charset=utf-8")
-	model := deviceModel(deviceURI)
-	uuid := stableUUID(deviceURI)
-	fmt.Fprintf(w, `<?xml version="1.0" encoding="UTF-8"?>
-<scan:ScannerCapabilities xmlns:scan="http://schemas.hp.com/imaging/escl/2011/05/03" xmlns:pwg="http://www.pwg.org/schemas/2010/12/sm">
-  <pwg:Version>2.6</pwg:Version>
-  <pwg:MakeAndModel>%s</pwg:MakeAndModel>
-  <pwg:SerialNumber>airscan-bridge</pwg:SerialNumber>
-  <scan:UUID>%s</scan:UUID>
-  <scan:AdminURI>http://127.0.0.1:%d/</scan:AdminURI>
-  <scan:Platen>
-    <scan:PlatenInputCaps>
-      <scan:MinWidth>16</scan:MinWidth>
-      <scan:MaxWidth>2550</scan:MaxWidth>
-      <scan:MinHeight>16</scan:MinHeight>
-      <scan:MaxHeight>3508</scan:MaxHeight>
-      <scan:MaxScanRegions>1</scan:MaxScanRegions>
-      <scan:SettingProfiles>
-        <scan:SettingProfile>
-          <scan:ColorModes>
-            <scan:ColorMode>BlackAndWhite1</scan:ColorMode>
-            <scan:ColorMode>Grayscale8</scan:ColorMode>
-            <scan:ColorMode>RGB24</scan:ColorMode>
-          </scan:ColorModes>
-          <scan:DocumentFormats>
-            <pwg:DocumentFormat>image/jpeg</pwg:DocumentFormat>
-            <pwg:DocumentFormat>application/pdf</pwg:DocumentFormat>
-          </scan:DocumentFormats>
-          <scan:DocumentFormatsExt>
-            <scan:DocumentFormatExt>image/jpeg</scan:DocumentFormatExt>
-            <scan:DocumentFormatExt>application/pdf</scan:DocumentFormatExt>
-          </scan:DocumentFormatsExt>
-          <scan:SupportedResolutions>
-            <scan:DiscreteResolutions>
-              <scan:DiscreteResolution><scan:XResolution>75</scan:XResolution><scan:YResolution>75</scan:YResolution></scan:DiscreteResolution>
-              <scan:DiscreteResolution><scan:XResolution>100</scan:XResolution><scan:YResolution>100</scan:YResolution></scan:DiscreteResolution>
-              <scan:DiscreteResolution><scan:XResolution>150</scan:XResolution><scan:YResolution>150</scan:YResolution></scan:DiscreteResolution>
-              <scan:DiscreteResolution><scan:XResolution>200</scan:XResolution><scan:YResolution>200</scan:YResolution></scan:DiscreteResolution>
-              <scan:DiscreteResolution><scan:XResolution>300</scan:XResolution><scan:YResolution>300</scan:YResolution></scan:DiscreteResolution>
-              <scan:DiscreteResolution><scan:XResolution>600</scan:XResolution><scan:YResolution>600</scan:YResolution></scan:DiscreteResolution>
-              <scan:DiscreteResolution><scan:XResolution>1200</scan:XResolution><scan:YResolution>1200</scan:YResolution></scan:DiscreteResolution>
-            </scan:DiscreteResolutions>
-          </scan:SupportedResolutions>
-          <scan:ColorSpaces><scan:ColorSpace>RGB</scan:ColorSpace></scan:ColorSpaces>
-        </scan:SettingProfile>
-      </scan:SettingProfiles>
-    </scan:PlatenInputCaps>
-  </scan:Platen>
-</scan:ScannerCapabilities>
-`, model, uuid, port)
+	w.Header().Set("Cache-Control", "no-store")
+	fmt.Fprint(w, s)
 }
-
-func handleStatus(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "text/xml; charset=utf-8")
-	fmt.Fprintf(w, `<?xml version="1.0" encoding="UTF-8"?>
-<scan:ScannerStatus xmlns:scan="http://schemas.hp.com/imaging/escl/2011/05/03" xmlns:pwg="http://www.pwg.org/schemas/2010/12/sm">
-  <pwg:Version>2.6</pwg:Version>
-  <pwg:State>Idle</pwg:State>
-  <scan:AdfState>ScannerAdfEmpty</scan:AdfState>
-  <scan:Jobs>`)
-	jobs.Range(func(k, v interface{}) bool {
-		j := v.(*Job)
-		fmt.Fprintf(w, `
-    <scan:JobInfo>
-      <pwg:JobUri>/eSCL/ScanJobs/%s</pwg:JobUri>
-      <pwg:JobUuid>%s</pwg:JobUuid>
-      <scan:Age>%d</scan:Age>
-      <scan:ImagesToTransfer>1</scan:ImagesToTransfer>
-      <scan:ImagesCompleted>0</scan:ImagesCompleted>
-      <pwg:JobState>%s</pwg:JobState>
-      <pwg:JobStateReasons><pwg:JobStateReason>JobScanning</pwg:JobStateReason></pwg:JobStateReasons>
-    </scan:JobInfo>`, j.ID, stableUUID(j.ID), int(time.Since(j.Started).Seconds()), j.State)
-		return true
-	})
-	fmt.Fprint(w, `
-  </scan:Jobs>
-</scan:ScannerStatus>
-`)
-}
-
-// loggingHandler wraps an http.Handler and logs every request.
-func loggingHandler(h http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		log.Printf("HTTP %s %s  ua=%q", r.Method, r.URL.Path, r.Header.Get("User-Agent"))
-		h.ServeHTTP(w, r)
-	})
-}
-
-func handleScanJobs(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	body, err := io.ReadAll(io.LimitReader(r.Body, 64*1024))
-	if err != nil {
-		http.Error(w, "bad body", http.StatusBadRequest)
-		return
-	}
-	var s ScanSettings
-	if err := xml.Unmarshal(body, &s); err != nil {
-		log.Printf("bad ScanSettings xml: %v\nbody=%q", err, body)
-		http.Error(w, "bad xml", http.StatusBadRequest)
-		return
-	}
-	if s.XResolution == 0 {
-		s.XResolution = 300
-	}
-	if s.DocumentFormat == "" {
-		s.DocumentFormat = "image/jpeg"
-	}
-	if s.ColorMode == "" {
-		s.ColorMode = "RGB24"
-	}
-	id := strconv.FormatInt(atomic.AddInt64(&jobSeq, 1), 10)
-	job := &Job{
-		ID:       id,
-		State:    "Processing",
-		Settings: s,
-		Started:  time.Now(),
-	}
-	jobs.Store(id, job)
-	log.Printf("POST /eSCL/ScanJobs -> job %s (%dDPI %s -> %s)", id, s.XResolution, s.ColorMode, s.DocumentFormat)
-	host := r.Host
-	if host == "" {
-		host = fmt.Sprintf("127.0.0.1:%d", port)
-	}
-	// Apple's Image Capture requires an absolute Location URL.
-	w.Header().Set("Location", fmt.Sprintf("http://%s/eSCL/ScanJobs/%s", host, id))
-	w.WriteHeader(http.StatusCreated)
-}
-
-func writeJobInfo(w http.ResponseWriter, job *Job) {
-	w.Header().Set("Content-Type", "text/xml; charset=utf-8")
-	images := 0
-	if job.State == "Completed" {
-		images = 1
-	}
-	fmt.Fprintf(w, `<?xml version="1.0" encoding="UTF-8"?>
-<scan:ScanJob xmlns:scan="http://schemas.hp.com/imaging/escl/2011/05/03" xmlns:pwg="http://www.pwg.org/schemas/2010/12/sm">
-  <pwg:JobUri>/eSCL/ScanJobs/%s</pwg:JobUri>
-  <pwg:JobUuid>%s</pwg:JobUuid>
-  <scan:Age>%d</scan:Age>
-  <scan:ImagesToTransfer>1</scan:ImagesToTransfer>
-  <scan:ImagesCompleted>%d</scan:ImagesCompleted>
-  <pwg:JobState>%s</pwg:JobState>
-  <pwg:JobStateReasons>
-    <pwg:JobStateReason>JobScanning</pwg:JobStateReason>
-  </pwg:JobStateReasons>
-</scan:ScanJob>
-`, job.ID, stableUUID(job.ID), int(time.Since(job.Started).Seconds()), images, job.State)
-}
-
-func handleScanJobItem(w http.ResponseWriter, r *http.Request) {
-	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/eSCL/ScanJobs/"), "/")
-	if len(parts) == 0 || parts[0] == "" {
-		log.Printf("%s %s -> 404 (empty id)", r.Method, r.URL.Path)
-		http.NotFound(w, r)
-		return
-	}
-	id := parts[0]
-	log.Printf("%s %s", r.Method, r.URL.Path)
-	v, ok := jobs.Load(id)
-	if !ok {
-		http.NotFound(w, r)
-		return
-	}
-	job := v.(*Job)
-
-	if r.Method == http.MethodDelete {
-		job.once.Do(func() {
-			if job.scanCmd != nil && job.scanCmd.Process != nil {
-				_ = job.scanCmd.Process.Kill()
+func (b *Bridge) status(w http.ResponseWriter, r *http.Request) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.Active == nil && (b.Probe != "" || b.WSD != nil) && time.Since(b.LastProbe) > 3*time.Second && time.Now().After(b.ReadyAfter) {
+		b.LastProbe = time.Now()
+		if b.WSD != nil {
+			ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+			b.ScannerState, b.AdfState, _ = b.WSD.status(ctx)
+			cancel()
+		} else {
+			data, e := outputCommand(b.Probe, b.Device.URI)
+			if e != nil {
+				b.ScannerState = "Stopped"
+				b.AdfState = "ScannerAdfUnknown"
+			} else {
+				b.ScannerState, b.AdfState = parseStatus(data)
 			}
-			if job.dataReader != nil {
-				_ = job.dataReader.Close()
-			}
-		})
-		jobs.Delete(id)
-		w.WriteHeader(http.StatusOK)
-		return
-	}
-
-	// GET /eSCL/ScanJobs/{id}  — return JobInfo XML
-	if len(parts) < 2 || parts[1] == "" {
-		writeJobInfo(w, job)
-		return
-	}
-
-	if parts[1] != "NextDocument" {
-		w.WriteHeader(http.StatusOK)
-		return
-	}
-
-	// NextDocument is single-shot for platen; second call → no more pages.
-	if job.State == "Completed" {
-		http.NotFound(w, r)
-		return
-	}
-
-	if err := streamScan(w, r, job); err != nil {
-		log.Printf("job %s scan error: %v", id, err)
-	}
-	job.State = "Completed"
-}
-
-// streamScan invokes scanimage and pipes its output to the HTTP client.
-func streamScan(w http.ResponseWriter, r *http.Request, job *Job) error {
-	mode := "Color"
-	switch job.Settings.ColorMode {
-	case "Grayscale8":
-		mode = "Gray"
-	case "BlackAndWhite1":
-		mode = "Lineart"
-	}
-	res := strconv.Itoa(job.Settings.XResolution)
-	wantPDF := job.Settings.DocumentFormat == "application/pdf"
-
-	args := []string{
-		"-d", deviceURI,
-		"--mode", mode,
-		"--resolution", res,
-		"--format", "jpeg",
-	}
-	cmd := exec.CommandContext(r.Context(), "scanimage", args...)
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return err
-	}
-	cmd.Stderr = os.Stderr
-	job.scanCmd = cmd
-	job.dataReader = stdout
-
-	log.Printf("job %s: starting scanimage %v", job.ID, args)
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("start: %w", err)
-	}
-
-	// Stream depending on format
-	if !wantPDF {
-		w.Header().Set("Content-Type", "image/jpeg")
-		w.WriteHeader(http.StatusOK)
-		if _, err := io.Copy(w, stdout); err != nil {
-			_ = cmd.Wait()
-			return fmt.Errorf("copy jpeg: %w", err)
 		}
-		return cmd.Wait()
 	}
-
-	// PDF: capture jpeg to temp file, then sips convert
-	tmpDir, err := os.MkdirTemp("", "airscan-bridge-*")
-	if err != nil {
-		return err
+	state, adf := b.ScannerState, b.AdfState
+	if b.Active != nil {
+		state = "Processing"
+		if b.Active.Settings.InputSource == "ADF" {
+			adf = "ScannerAdfProcessing"
+		}
 	}
-	defer os.RemoveAll(tmpDir)
-	jpgPath := tmpDir + "/scan.jpg"
-	pdfPath := tmpDir + "/scan.pdf"
-	jpgFile, err := os.Create(jpgPath)
-	if err != nil {
-		return err
+	var s strings.Builder
+	fmt.Fprintf(&s, `<?xml version="1.0"?><scan:ScannerStatus xmlns:scan="%s" xmlns:pwg="%s"><pwg:Version>2.6</pwg:Version><pwg:State>%s</pwg:State><scan:AdfState>%s</scan:AdfState><scan:Jobs>`, scanNS, pwgNS, state, adf)
+	for _, j := range b.Jobs {
+		s.WriteString(b.jobInfo(j))
 	}
-	if _, err := io.Copy(jpgFile, stdout); err != nil {
-		jpgFile.Close()
-		return err
+	s.WriteString("</scan:Jobs></scan:ScannerStatus>")
+	xmlResponse(w, s.String())
+}
+func parseStatus(data []byte) (string, string) {
+	state, adf, reason := "Stopped", "ScannerAdfUnknown", ""
+	seenState := false
+	dec := xml.NewDecoder(strings.NewReader(string(data)))
+	for {
+		t, e := dec.Token()
+		if e != nil {
+			if e != io.EOF {
+				return "Stopped", "ScannerAdfUnknown"
+			}
+			break
+		}
+		if el, ok := t.(xml.StartElement); ok {
+			switch el.Name.Local {
+			case "PaperInADF", "ScannerState", "ScannerStateReason":
+				var v string
+				if dec.DecodeElement(&v, &el) != nil {
+					return "Stopped", "ScannerAdfUnknown"
+				}
+				v = strings.TrimSpace(v)
+				switch el.Name.Local {
+				case "PaperInADF":
+					if v == "true" || v == "1" {
+						adf = "ScannerAdfLoaded"
+					} else if v == "false" || v == "0" {
+						adf = "ScannerAdfEmpty"
+					}
+				case "ScannerState":
+					seenState = true
+					if v == "Idle" {
+						state = "Idle"
+					} else if v == "Processing" {
+						state = "Processing"
+					}
+				case "ScannerStateReason":
+					reason = v
+				}
+			}
+		}
 	}
-	jpgFile.Close()
-	if err := cmd.Wait(); err != nil {
-		return fmt.Errorf("scanimage exited: %w", err)
+	if !seenState {
+		return "Stopped", "ScannerAdfUnknown"
 	}
-	if out, err := exec.Command("sips", "-s", "format", "pdf", jpgPath, "--out", pdfPath).CombinedOutput(); err != nil {
-		return fmt.Errorf("sips: %w (%s)", err, out)
+	if reason == "MediaJam" {
+		adf = "ScannerAdfJam"
+		state = "Stopped"
 	}
-	pdfFile, err := os.Open(pdfPath)
-	if err != nil {
-		return err
-	}
-	defer pdfFile.Close()
-	w.Header().Set("Content-Type", "application/pdf")
-	w.WriteHeader(http.StatusOK)
-	_, err = io.Copy(w, pdfFile)
-	return err
+	return state, adf
 }
 
-// stableUUID derives a deterministic uuid-ish string from a URI.
-func stableUUID(uri string) string {
-	// not crypto, just stable across restarts
-	h := uint64(1469598103934665603)
-	for _, b := range []byte(uri) {
-		h ^= uint64(b)
-		h *= 1099511628211
-	}
-	s := fmt.Sprintf("%016x", h)
-	// pad
-	for len(s) < 32 {
-		s += s
-	}
-	return fmt.Sprintf("%s-%s-%s-%s-%s", s[0:8], s[8:12], s[12:16], s[16:20], s[20:32])
+type responseTrace struct {
+	http.ResponseWriter
+	code, bytes int
 }
 
-// -------- mDNS via dns-sd subprocess --------
-
-var port = 8089
-
-func advertise(ctx context.Context, model, uuid string) error {
-	// _uscan._tcp = AirScan/Mopria scan
-	args := []string{
-		"-R",
-		fmt.Sprintf("%s (USB-bridge)", model),
-		"_uscan._tcp",
-		"local",
-		strconv.Itoa(port),
-		"txtvers=1",
-		"vers=2.6",
-		"ty=" + model,
-		"note=via airscan-bridge",
-		"adminurl=http://127.0.0.1:" + strconv.Itoa(port) + "/",
-		"representation=http://127.0.0.1:" + strconv.Itoa(port) + "/icon.png",
-		"UUID=" + uuid,
-		"rs=eSCL",
-		"pdl=image/jpeg,application/pdf",
-		"cs=color,grayscale,binary",
-		"is=platen",
-		"duplex=F",
+func (w *responseTrace) WriteHeader(code int) {
+	if w.code != 0 {
+		return
 	}
-	cmd := exec.CommandContext(ctx, "dns-sd", args...)
-	cmd.Stdout = io.Discard
-	cmd.Stderr = io.Discard
-	log.Printf("advertising _uscan._tcp on port %d as %q", port, model)
+	w.code = code
+	w.ResponseWriter.WriteHeader(code)
+}
+func (w *responseTrace) Write(p []byte) (int, error) {
+	if w.code == 0 {
+		w.WriteHeader(http.StatusOK)
+	}
+	n, err := w.ResponseWriter.Write(p)
+	w.bytes += n
+	return n, err
+}
+func (b *Bridge) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if os.Getenv("AIRSCAN_DEBUG") == "1" {
+		start := time.Now()
+		trace := &responseTrace{ResponseWriter: w}
+		w = trace
+		defer func() {
+			code := trace.code
+			if code == 0 {
+				code = http.StatusOK
+			}
+			log.Printf("HTTP %s %s -> %d bytes=%d elapsed=%s ua=%q", r.Method, r.URL.Path, code, trace.bytes, time.Since(start).Round(time.Millisecond), r.UserAgent())
+		}()
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	// Browser origins cannot start scans. Native eSCL clients do not send Origin.
+	if r.Header.Get("Origin") != "" {
+		http.Error(w, "browser cross-origin access is disabled", 403)
+		return
+	}
+	if r.Method == http.MethodGet {
+		switch r.URL.Path {
+		case "/eSCL/ScannerCapabilities":
+			xmlResponse(w, b.Device.capabilities())
+			return
+		case "/eSCL/ScannerStatus":
+			b.status(w, r)
+			return
+		case "/":
+			fmt.Fprintf(w, "HP SOAPHT AirScan bridge\n%s\n", b.Device.Model)
+			return
+		}
+	}
+	if r.URL.Path == "/eSCL/ScanJobs" {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(405)
+			return
+		}
+		b.create(w, r)
+		return
+	}
+	if strings.HasPrefix(r.URL.Path, "/eSCL/ScanJobs/") {
+		b.item(w, r)
+		return
+	}
+	http.NotFound(w, r)
+}
+func (b *Bridge) create(w http.ResponseWriter, r *http.Request) {
+	data, e := io.ReadAll(http.MaxBytesReader(w, r.Body, 65536))
+	if e != nil {
+		http.Error(w, "request too large", 413)
+		return
+	}
+	s, e := parseSettings(data, b.Device)
+	if e != nil {
+		http.Error(w, e.Error(), 400)
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.Closed || b.Active != nil || len(b.Jobs) >= 4 {
+		w.Header().Set("Retry-After", "2")
+		http.Error(w, "scanner busy", 503)
+		return
+	}
+	dir, e := os.MkdirTemp("", "hp-airscan-job-")
+	if e != nil {
+		http.Error(w, "cannot create spool", 500)
+		return
+	}
+	b.Seq++
+	id := fmt.Sprintf("%s-%d", stableUUID(dir)[:8], b.Seq)
+	j := &Job{ID: id, Dir: dir, Settings: s, State: "Pending", Reason: "JobQueued", Started: time.Now(), Touched: time.Now(), Changed: make(chan struct{}), Cancel: make(chan struct{})}
+	b.Jobs[id] = j
+	b.Active = j
+	w.Header().Set("Location", "http://"+r.Host+"/eSCL/ScanJobs/"+id)
+	w.WriteHeader(201)
+	if os.Getenv("AIRSCAN_DEBUG") == "1" {
+		log.Printf("job %s settings: source=%s dpi=%d mode=%s region=%+v", id, s.InputSource, s.XResolution, s.ColorMode, s.Regions[0])
+	}
+	go b.run(j)
+}
+func (b *Bridge) run(j *Job) {
+	b.mu.Lock()
+	delay := time.Until(b.ReadyAfter)
+	b.mu.Unlock()
+	if delay > 0 {
+		select {
+		case <-time.After(delay):
+		case <-j.Cancel:
+			b.finish(j, nil, "")
+			return
+		}
+	}
+	select {
+	case <-j.Cancel:
+		b.finish(j, nil, "")
+		return
+	default:
+	}
+	if b.WSD != nil {
+		b.runWSD(j)
+		return
+	}
+	cmd := exec.Command(b.Scanimage, j.Settings.args(b.Device.URI, j.Dir)...)
+	cmd.Env = commandEnv()
+	if os.Getenv("AIRSCAN_DEBUG") == "1" {
+		cmd.Env = append(cmd.Env, "SANE_DEBUG_HPAIO=6")
+	}
+	stdout, e := cmd.StdoutPipe()
+	if e != nil {
+		b.finish(j, e, "")
+		return
+	}
+	stderr := &limitedLog{}
+	cmd.Stderr = stderr
+	b.mu.Lock()
+	if j.State == "Canceled" {
+		b.mu.Unlock()
+		b.finish(j, nil, "")
+		return
+	}
+	j.Cmd = cmd
+	e = cmd.Start()
+	if e == nil {
+		j.State = "Processing"
+		j.Reason = "JobScanning"
+	}
+	b.notify(j)
+	b.mu.Unlock()
+	if e != nil {
+		b.finish(j, e, "")
+		return
+	}
+	exited := make(chan struct{})
+	go func() {
+		select {
+		case <-j.Cancel:
+		case <-time.After(15 * time.Minute):
+			b.mu.Lock()
+			if !j.Done {
+				j.Failure = "JobTimedOut"
+				b.cancel(j)
+			}
+			b.mu.Unlock()
+		case <-exited:
+			return
+		}
+		_ = cmd.Process.Signal(os.Interrupt)
+		select {
+		case <-exited:
+		case <-time.After(320 * time.Second):
+			_ = cmd.Process.Kill()
+		}
+	}()
+	scanner := bufio.NewScanner(stdout)
+	var total int64
+	var pageErr error
+	for scanner.Scan() {
+		name := scanner.Text()
+		expected := filepath.Join(j.Dir, fmt.Sprintf("page-%04d.jpg", len(j.Pages)+1))
+		if name != expected {
+			pageErr = fmt.Errorf("unexpected spool path")
+			break
+		}
+		info, e := os.Stat(name)
+		if e != nil || info.Size() > 32<<20 {
+			pageErr = fmt.Errorf("invalid page size")
+			break
+		}
+		total += info.Size()
+		if total > 256<<20 || len(j.Pages) >= 100 {
+			pageErr = fmt.Errorf("batch limit exceeded")
+			break
+		}
+		f, e := os.Open(name)
+		if e != nil {
+			pageErr = e
+			break
+		}
+		cfg, e := jpeg.DecodeConfig(f)
+		f.Close()
+		if e != nil || cfg.Width < 1 || cfg.Height < 1 || int64(cfg.Width)*int64(cfg.Height) > 150000000 {
+			pageErr = fmt.Errorf("invalid JPEG page")
+			break
+		}
+		b.mu.Lock()
+		j.Pages = append(j.Pages, name)
+		b.notify(j)
+		b.mu.Unlock()
+	}
+	if scanner.Err() != nil {
+		pageErr = scanner.Err()
+	}
+	if pageErr != nil {
+		b.mu.Lock()
+		j.Failure = "ErrorsDetected"
+		b.cancel(j)
+		b.mu.Unlock()
+	}
+	e = cmd.Wait()
+	close(exited)
+	if pageErr != nil {
+		e = pageErr
+	}
+	// Keep Active set while recovering: neither another scan nor status probe
+	// may consume the pending reply before the drain reaches a quiet boundary.
+	if e != nil && b.Probe != "" {
+		ctx, cancel := context.WithTimeout(context.Background(), 65*time.Second)
+		recovery := exec.CommandContext(ctx, b.Probe, "--recover", b.Device.URI)
+		recovery.Env = commandEnv()
+		var note limitedLog
+		recovery.Stderr = &note
+		data, recoveryErr := recovery.Output()
+		cancel()
+		log.Printf("job %s transport recovery: %v; %s", j.ID, recoveryErr, strings.TrimSpace(note.String()))
+		b.mu.Lock()
+		if recoveryErr == nil {
+			j.RecoveryState, j.RecoveryADF = parseStatus(data)
+		}
+		b.mu.Unlock()
+	}
+	b.finish(j, e, stderr.String())
+}
+
+type limitedLog struct {
+	mu   sync.Mutex
+	text string
+}
+
+func (l *limitedLog) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.text += string(p)
+	if len(l.text) > 16384 {
+		l.text = l.text[len(l.text)-16384:]
+	}
+	return len(p), nil
+}
+func (l *limitedLog) String() string { l.mu.Lock(); defer l.mu.Unlock(); return l.text }
+func (b *Bridge) finish(j *Job, err error, detail string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	j.Done = true
+	j.Cmd = nil
+	if b.Active == j {
+		b.Active = nil
+	}
+	b.ReadyAfter = time.Now().Add(b.Settle)
+	b.LastProbe = time.Time{}
+	if j.Failure != "" {
+		j.State = "Aborted"
+		j.ErrorHTTP = 500
+		j.Reason = j.Failure
+		b.ScannerState = "Stopped"
+	}
+	if j.State != "Canceled" {
+		if err != nil || j.Failure != "" {
+			j.State = "Aborted"
+			j.ErrorHTTP = 500
+			if j.Failure == "" {
+				j.Reason = "ErrorsDetected"
+			}
+			b.ScannerState = "Stopped"
+			switch {
+			case strings.Contains(detail, "out of documents"):
+				b.AdfState = "ScannerAdfEmpty"
+				j.ErrorHTTP = 404
+			case strings.Contains(detail, "jammed"):
+				b.AdfState = "ScannerAdfJam"
+			}
+			log.Printf("job %s failed: %v; %s", j.ID, err, strings.TrimSpace(detail))
+		} else {
+			j.State = "Processing"
+			j.Reason = "JobCompletedSuccessfully"
+			b.ScannerState = "Idle"
+			if j.Settings.InputSource == "ADF" && strings.Contains(detail, "out of documents") {
+				b.AdfState = "ScannerAdfEmpty"
+			}
+			if j.Sent == len(j.Pages) {
+				j.State = "Completed"
+			}
+		}
+	}
+	if j.RecoveryState != "" {
+		b.ScannerState, b.AdfState = j.RecoveryState, j.RecoveryADF
+	}
+	b.notify(j)
+	if j.Deleted && !j.Reading {
+		delete(b.Jobs, j.ID)
+		os.RemoveAll(j.Dir)
+	}
+	log.Printf("job %s acquisition ended: %s, %d pages", j.ID, j.State, len(j.Pages))
+}
+func (b *Bridge) item(w http.ResponseWriter, r *http.Request) {
+	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/eSCL/ScanJobs/"), "/")
+	if len(parts) > 2 || parts[0] == "" {
+		http.NotFound(w, r)
+		return
+	}
+	b.mu.Lock()
+	j := b.Jobs[parts[0]]
+	if j == nil {
+		b.mu.Unlock()
+		http.NotFound(w, r)
+		return
+	}
+	j.Touched = time.Now()
+	if len(parts) == 1 {
+		if r.Method == http.MethodDelete {
+			j.Deleted = true
+			b.cancel(j)
+			if j.Done && !j.Reading {
+				delete(b.Jobs, j.ID)
+				os.RemoveAll(j.Dir)
+			}
+			b.mu.Unlock()
+			w.WriteHeader(200)
+			return
+		}
+		if r.Method != http.MethodGet {
+			b.mu.Unlock()
+			w.WriteHeader(405)
+			return
+		}
+		s := fmt.Sprintf(`<scan:ScanJob xmlns:scan="%s" xmlns:pwg="%s">%s</scan:ScanJob>`, scanNS, pwgNS, b.jobInfo(j))
+		b.mu.Unlock()
+		xmlResponse(w, s)
+		return
+	}
+	if parts[1] != "NextDocument" {
+		b.mu.Unlock()
+		http.NotFound(w, r)
+		return
+	}
+	if r.Method != http.MethodGet {
+		b.mu.Unlock()
+		w.WriteHeader(405)
+		return
+	}
+	if j.Reading {
+		b.mu.Unlock()
+		http.Error(w, "page request already active", 409)
+		return
+	}
+	j.Reading = true
+	b.mu.Unlock()
+	defer func() {
+		b.mu.Lock()
+		j.Reading = false
+		if j.Deleted && j.Done {
+			delete(b.Jobs, j.ID)
+			os.RemoveAll(j.Dir)
+		}
+		b.mu.Unlock()
+	}()
+	// Apple AirScan can defer its cancel request while NextDocument is held
+	// open. Bound each wait so the client can process cancel between retries.
+	pending := time.NewTimer(2 * time.Second)
+	defer pending.Stop()
+	for {
+		b.mu.Lock()
+		if j.State == "Canceled" && j.Failure == "" {
+			b.mu.Unlock()
+			http.NotFound(w, r)
+			return
+		}
+		if j.Sent < len(j.Pages) {
+			path := j.Pages[j.Sent]
+			b.mu.Unlock()
+			f, e := os.Open(path)
+			if e != nil {
+				http.Error(w, "page unavailable", 500)
+				return
+			}
+			w.Header().Set("Content-Type", "image/jpeg")
+			_, e = io.Copy(w, f)
+			f.Close()
+			b.mu.Lock()
+			if e == nil {
+				j.Sent++
+				j.Touched = time.Now()
+				if j.Done && j.Sent == len(j.Pages) && j.State != "Aborted" {
+					j.State = "Completed"
+				}
+			} else {
+				b.cancel(j)
+			}
+			b.mu.Unlock()
+			return
+		}
+		if j.Done || j.Failure != "" {
+			aborted := j.State == "Aborted" || j.Failure != ""
+			code := j.ErrorHTTP
+			if code == 0 {
+				code = 500
+			}
+			b.mu.Unlock()
+			if aborted {
+				http.Error(w, "scan acquisition failed; see ScannerStatus", code)
+			} else {
+				http.NotFound(w, r)
+			}
+			return
+		}
+		changed := j.Changed
+		b.mu.Unlock()
+		select {
+		case <-changed:
+		case <-pending.C:
+			w.Header().Set("Retry-After", "1")
+			http.Error(w, "image acquisition in progress", http.StatusServiceUnavailable)
+			return
+		case <-r.Context().Done():
+			b.mu.Lock()
+			b.cancel(j)
+			b.mu.Unlock()
+			return
+		}
+	}
+}
+func (b *Bridge) reap() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for id, j := range b.Jobs {
+		if time.Since(j.Touched) > 2*time.Minute && !j.Reading {
+			if j.Done {
+				os.RemoveAll(j.Dir)
+				delete(b.Jobs, id)
+			} else {
+				b.cancel(j)
+			}
+		}
+	}
+}
+func (b *Bridge) shutdown() {
+	b.mu.Lock()
+	b.Closed = true
+	for _, j := range b.Jobs {
+		if !j.Done {
+			b.cancel(j)
+		}
+	}
+	b.mu.Unlock()
+}
+func advertise(ctx context.Context, d Device, port int) error {
+	uuid := stableUUID(d.URI)
+	host := "hp-soapht-" + uuid[:8] + ".local"
+	sources := []string{}
+	colors := []string{}
+	seen := map[string]bool{}
+	for _, s := range d.Sources {
+		if s.Name == "Flatbed" {
+			sources = append(sources, "platen")
+		} else {
+			sources = append(sources, "adf")
+		}
+		for _, m := range s.Modes {
+			v := "grayscale"
+			if m == "RGB24" {
+				v = "color"
+			}
+			if !seen[v] {
+				colors = append(colors, v)
+				seen[v] = true
+			}
+		}
+	}
+	label := "SOAPHT"
+	if d.Transport != "" {
+		label = d.Transport
+	}
+	args := []string{"-lo", "-P", d.Model + " (" + label + ")", "_uscan._tcp", "local", strconv.Itoa(port), host, "127.0.0.1", "txtvers=1", "vers=2.6", "ty=" + d.Model, "UUID=" + uuid, "rs=eSCL", "pdl=image/jpeg", "cs=" + strings.Join(colors, ","), "is=" + strings.Join(sources, ","), "duplex=F"}
+	cmd := exec.CommandContext(ctx, "/usr/bin/dns-sd", args...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
 	return cmd.Run()
 }
-
-// -------- main --------
-
 func main() {
-	deviceURI = detectDevice()
-	if deviceURI == "" {
-		log.Fatal("no SANE scanner detected via `scanimage -L`. Ensure your printer is connected and the hpaio backend is installed.")
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+	scanimage := os.Getenv("AIRSCAN_SCANIMAGE")
+	if scanimage == "" {
+		scanimage = "/opt/homebrew/bin/scanimage"
 	}
-	log.Printf("scanner: %s (%s)", deviceURI, deviceModel(deviceURI))
+	probe := os.Getenv("AIRSCAN_PROBE")
+	if probe == "" {
+		probe = "/opt/homebrew/bin/hp-soapht-probe"
+	}
+	var d Device
+	var e error
+	var wsd *WSDClient
+	if endpoint := os.Getenv("AIRSCAN_WSD_URL"); endpoint != "" {
+		if os.Getenv("AIRSCAN_DEVICE") != "" {
+			log.Fatal("choose either AIRSCAN_WSD_URL or AIRSCAN_DEVICE")
+		}
+		wsd, e = newWSDClient(endpoint)
+		if e != nil {
+			log.Fatal(e)
+		}
+		d, e = waitWSDDevice(ctx, wsd.device, 30*time.Second)
+		if e != nil {
+			return
+		}
+	} else {
+		d, e = detectDevice(scanimage, os.Getenv("AIRSCAN_DEVICE"))
+		if e != nil {
+			log.Fatal(e)
+		}
+		// The probe validates HPLIP scan-type=5 before any Bonjour advertisement.
+		caps, e := outputCommand(probe, d.URI)
+		if e != nil {
+			log.Fatalf("SOAPHT capability probe: %v", e)
+		}
+		if e = d.applyMinimums(caps); e != nil {
+			log.Fatalf("SOAPHT minimum geometry: %v", e)
+		}
 
-	if envPort := os.Getenv("AIRSCAN_PORT"); envPort != "" {
-		if p, err := strconv.Atoi(envPort); err == nil {
-			port = p
+	}
+	if name := strings.TrimSpace(os.Getenv("AIRSCAN_NAME")); name != "" {
+		if len(name) > 80 {
+			log.Fatal("AIRSCAN_NAME must be at most 80 bytes")
+		}
+		d.Model = name
+	}
+	b := newBridge(d, scanimage, probe)
+	b.WSD = wsd
+
+	port := 8089
+	if v := os.Getenv("AIRSCAN_PORT"); v != "" {
+		port, e = strconv.Atoi(v)
+		if e != nil || port < 1024 || port > 65535 {
+			log.Fatal("invalid AIRSCAN_PORT")
 		}
 	}
-
-	mux := http.NewServeMux()
-	mux.HandleFunc("/eSCL/ScannerCapabilities", handleCapabilities)
-	mux.HandleFunc("/eSCL/ScannerStatus", handleStatus)
-	mux.HandleFunc("/eSCL/ScanJobs", handleScanJobs)
-	mux.HandleFunc("/eSCL/ScanJobs/", handleScanJobItem)
-	mux.HandleFunc("/icon.png", func(w http.ResponseWriter, r *http.Request) {
-		// 1x1 transparent PNG so Image Capture has something to render.
-		w.Header().Set("Content-Type", "image/png")
-		w.Write([]byte{
-			0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d,
-			0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
-			0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4, 0x89, 0x00, 0x00, 0x00,
-			0x0d, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0x00, 0x01, 0x00, 0x00,
-			0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00, 0x00, 0x00, 0x00, 0x49,
-			0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
-		})
-	})
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintf(w, "airscan-bridge\nscanner: %s\n", deviceURI)
-	})
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
+	listener, e := net.Listen("tcp4", fmt.Sprintf("127.0.0.1:%d", port))
+	if e != nil {
+		log.Fatal(e)
+	}
+	srv := &http.Server{Handler: b, ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 20 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16384}
 	go func() {
-		// keep advertising; restart on failure
+		if e := srv.Serve(listener); e != nil && !errors.Is(e, http.ErrServerClosed) {
+			log.Print(e)
+			cancel()
+		}
+	}()
+	go func() {
 		for ctx.Err() == nil {
-			if err := advertise(ctx, deviceModel(deviceURI), stableUUID(deviceURI)); err != nil && !errors.Is(ctx.Err(), context.Canceled) {
-				log.Printf("dns-sd exited: %v; respawning in 2s", err)
-				time.Sleep(2 * time.Second)
+			if e := advertise(ctx, d, port); e != nil && ctx.Err() == nil {
+				log.Printf("Bonjour: %v", e)
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(3 * time.Second):
 			}
 		}
 	}()
-
-	srv := &http.Server{Addr: fmt.Sprintf(":%d", port), Handler: loggingHandler(mux)}
 	go func() {
-		log.Printf("eSCL HTTP listening on http://127.0.0.1:%d", port)
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Fatal(err)
+		t := time.NewTicker(15 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				b.reap()
+			}
 		}
 	}()
-
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
-	<-sig
-	log.Println("shutting down")
-	cancel()
-	shutdownCtx, c2 := context.WithTimeout(context.Background(), 3*time.Second)
-	defer c2()
-	srv.Shutdown(shutdownCtx)
+	log.Printf("%s: local eSCL ready on 127.0.0.1:%d", d.Model, port)
+	<-ctx.Done()
+	b.shutdown()
+	shutdown, c := context.WithTimeout(context.Background(), 390*time.Second)
+	defer c()
+	_ = srv.Shutdown(shutdown)
+	// Wait for native CancelJob cleanup even when no HTTP request is active.
+	for {
+		b.mu.Lock()
+		active := b.Active != nil
+		b.mu.Unlock()
+		if !active {
+			break
+		}
+		select {
+		case <-shutdown.Done():
+			return
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+	b.mu.Lock()
+	for _, j := range b.Jobs {
+		os.RemoveAll(j.Dir)
+	}
+	b.mu.Unlock()
 }

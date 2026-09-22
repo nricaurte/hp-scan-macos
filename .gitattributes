@@ -1,0 +1,2 @@
+# Unified diffs include upstream context/deletions with trailing whitespace.
+patches/*.patch whitespace=-blank-at-eol
