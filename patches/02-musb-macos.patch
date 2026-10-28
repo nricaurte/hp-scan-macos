@@ -1,16 +1,7 @@
 --- a/io/hpmud/musb.c
 +++ b/io/hpmud/musb.c
-@@ -758,7 +758,7 @@ static int device_id(int fd, unsigned char *buffer, int size)
-
-     maxSize = (size > 1024) ? 1024 : size;   /* RH8 has a size limit for device id (usb) */
-
--    rlen = libusb_control_transfer(hd,
-+    rlen = libusb_control_transfer(hd,                          /* macOS: see workaround below */
-             LIBUSB_ENDPOINT_IN | LIBUSB_REQUEST_TYPE_CLASS | LIBUSB_RECIPIENT_INTERFACE, /* bmRequestType */
-             LIBUSB_REQUEST_GET_STATUS,        /* bRequest */
-             config,        /* wValue */
-@@ -767,8 +767,21 @@ static int device_id(int fd, unsigned char *buffer, int size)
-
+@@ -767,8 +767,23 @@
+ 
      if (rlen < 0)
      {
 +#ifdef __APPLE__
@@ -31,11 +22,11 @@
          goto bugout;
 +#endif
      }
-
+ 
      len = ntohs(*(short *)buffer);
-@@ -2178,7 +2191,7 @@ int __attribute__ ((visibility ("hidden"))) musb_probe_devices(char *lst, int ls
+@@ -2156,7 +2171,7 @@
      }//end for loop
-
+ 
  bugout:
 -    if (!hd)
 +    if (hd)            /* fix: previous code closed a NULL handle on success path */

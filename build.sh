@@ -1,18 +1,25 @@
 #!/usr/bin/env bash
-# Build & install HPLIP scanner backend (hpaio) for macOS, Apple Silicon.
+# Build & install HPLIP scanner backend (hpaio) for macOS (arm64 or Intel).
 #
 # Tested on:
-#   macOS 26 (Tahoe), arm64
+#   macOS 26 (Tahoe), arm64, Homebrew sane-backends 1.4.0, libusb 1.0.29
+#   macOS 15 (Sequoia), x86_64, MacPorts sane-backends 1.3.1, libusb 1.0.30
 #   HPLIP 3.25.8
-#   Homebrew sane-backends 1.4.0, libusb 1.0.29
 #
 # What this does:
 #   1. downloads HPLIP 3.25.8 source
 #   2. applies patches/ to make the SANE backend build on Darwin
 #   3. compiles libsane-hpaio.1.so + libhpmud + libhpip
-#   4. installs to /opt/homebrew (Homebrew prefix)
+#   4. installs to the package manager's prefix (Homebrew or MacPorts)
 #   5. registers `hpaio` in SANE's dll.conf
-#   6. installs /opt/homebrew/bin/hp-scan wrapper
+#   6. installs $PREFIX/bin/hp-scan wrapper
+#
+# Run it as your normal user, not with sudo; it asks for your password only
+# when the prefix is root-owned (MacPorts' /opt/local).
+#
+# Overrides:
+#   PKG_MGR=brew|macports   pick the package manager when both are installed
+#   PREFIX=/some/path       install somewhere else (implies no auto-install)
 #
 # After this, `scanimage -L` should list your HP printer and you can scan
 # with `hp-scan` (or any SANE frontend).
@@ -20,7 +27,6 @@
 set -euo pipefail
 
 HPLIP_VER="${HPLIP_VER:-3.25.8}"
-PREFIX="${PREFIX:-/opt/homebrew}"
 WORK="${WORK:-/tmp/hplip-build}"
 HPLIP_URL="https://sourceforge.net/projects/hplip/files/hplip/${HPLIP_VER}/hplip-${HPLIP_VER}.tar.gz/download"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -31,18 +37,82 @@ blue()  { printf '\033[34m%s\033[0m\n' "$*"; }
 
 require() { command -v "$1" >/dev/null 2>&1 || { red "Missing: $1"; exit 1; }; }
 
+if [[ $EUID -eq 0 ]]; then
+    red "Don't run build.sh with sudo; it asks for your password when it needs it."
+    exit 1
+fi
+
 blue "==> checking prerequisites"
-require brew
 require curl
 require gcc
 require make
+require python3
 
-for pkg in libusb sane-backends; do
-    if ! brew list --formula "$pkg" >/dev/null 2>&1; then
-        blue "==> installing $pkg"
-        brew install "$pkg"
+# Pick a package manager: explicit PKG_MGR, else whichever one already has
+# sane-backends, else whichever one is installed (Homebrew first).
+has_brew() { command -v brew >/dev/null 2>&1; }
+has_port() { command -v port >/dev/null 2>&1; }
+brew_has_sane() { has_brew && brew list --formula sane-backends >/dev/null 2>&1; }
+port_has_sane() { has_port && port -q installed sane-backends 2>/dev/null | grep -q '(active)'; }
+
+if [[ -z "${PKG_MGR:-}" ]]; then
+    if   brew_has_sane; then PKG_MGR=brew
+    elif port_has_sane; then PKG_MGR=macports
+    elif has_brew;      then PKG_MGR=brew
+    elif has_port;      then PKG_MGR=macports
+    elif [[ -n "${PREFIX:-}" ]]; then PKG_MGR=none
+    else
+        red "Neither Homebrew nor MacPorts found. Install one of them, or set PREFIX"
+        red "to wherever libusb-1.0 and sane-backends are installed."
+        exit 1
     fi
-done
+fi
+
+case "$PKG_MGR" in
+    brew)
+        require brew
+        PREFIX="${PREFIX:-$(brew --prefix)}"
+        for pkg in libusb sane-backends; do
+            if ! brew list --formula "$pkg" >/dev/null 2>&1; then
+                blue "==> installing $pkg"
+                brew install "$pkg"
+            fi
+        done
+        ;;
+    macports)
+        require port
+        PREFIX="${PREFIX:-$(dirname "$(dirname "$(command -v port)")")}"
+        missing=()
+        for pkg in libusb sane-backends pkgconfig; do
+            port -q installed "$pkg" 2>/dev/null | grep -q '(active)' || missing+=("$pkg")
+        done
+        if (( ${#missing[@]} )); then
+            blue "==> installing ${missing[*]} (MacPorts needs your password)"
+            sudo port install "${missing[@]}"
+        fi
+        ;;
+    none) ;;
+    *)
+        red "Unknown PKG_MGR=$PKG_MGR (expected brew or macports)"
+        exit 1
+        ;;
+esac
+blue "==> using $PKG_MGR, prefix $PREFIX"
+
+# Homebrew's prefix is user-writable; MacPorts' /opt/local is root-owned.
+SUDO=""
+if [[ ! -w "$PREFIX/lib" ]]; then
+    SUDO="sudo"
+fi
+
+# An earlier `sudo ./build.sh` leaves the app root-owned; catch that before
+# spending time on the build.
+APP="$HOME/Applications/HP Scan.app"
+if [[ -e "$APP" && ! -w "$APP/Contents/MacOS/hp-scan-app" ]]; then
+    red "$APP is not writable (probably from an earlier sudo run). Fix with:"
+    red "  sudo chown -R $(id -un) \"$APP\""
+    exit 1
+fi
 
 mkdir -p "$WORK"
 cd "$WORK"
@@ -68,11 +138,17 @@ cp "$SCRIPT_DIR/stubs/orblite.c"  scan/sane/orblite.c
 for p in "$SCRIPT_DIR"/patches/01-darwin-headers.patch \
          "$SCRIPT_DIR"/patches/02-musb-macos.patch \
          "$SCRIPT_DIR"/patches/03-hpaio-uninit-fix.patch; do
-    if patch -p1 --dry-run --silent < "$p" >/dev/null 2>&1; then
-        patch -p1 < "$p"
+    # -N: never auto-reverse. Without it, macOS patch silently answers "yes" to
+    # "Reversed (or previously applied) patch detected! Assume -R?" and every
+    # second run un-applies the patch.
+    if patch -p1 -N --dry-run --silent < "$p" >/dev/null 2>&1; then
+        patch -p1 -N < "$p"
+    elif patch -p1 -R --dry-run --silent < "$p" >/dev/null 2>&1; then
+        echo "already applied: $(basename "$p")"
     else
-        # already applied; skip
-        :
+        red "patch does not apply: $p"
+        patch -p1 -N --dry-run < "$p" || true
+        exit 1
     fi
 done
 
@@ -98,14 +174,15 @@ LDFLAGS="-L$PREFIX/lib" \
     --disable-cups-ppd-install >/dev/null
 
 # Patch the generated Makefile: drop libhpipp dependency (we don't build it),
-# and point hplip_confdir to our Homebrew prefix.
+# and point hplip_confdir to our prefix.
 sed -i.bak \
     -e 's|^hplip_confdir = /etc/hp$|hplip_confdir = '"$PREFIX"'/etc/hp|' \
     Makefile
 
 # Remove libhpipp.la from libsane_hpaio_la link deps (it's empty when network/IPP
 # is disabled, and `ar cr` errors on empty archives).
-python3 - <<PYEOF
+# Quoted heredoc: an unquoted one lets bash eat the regex backslashes.
+python3 - <<'PYEOF'
 import re, pathlib
 mk = pathlib.Path('Makefile')
 src = mk.read_text()
@@ -115,40 +192,47 @@ mk.write_text(src)
 PYEOF
 
 blue "==> make libsane-hpaio.la"
-make -k libhpmud.la libhpip.la libsane-hpaio.la 2>&1 | grep -E '(error:|Error)' | grep -v 'libhpipp' || true
+MAKE_LOG="$WORK/make.log"
+make -k libhpmud.la libhpip.la libsane-hpaio.la > "$MAKE_LOG" 2>&1 || true
+grep -E '(error:|Error)' "$MAKE_LOG" | grep -v 'libhpipp' || true
 
 if [[ ! -f .libs/libsane-hpaio.1.so ]]; then
-    red "build failed — libsane-hpaio.1.so was not produced"
+    red "build failed — libsane-hpaio.1.so was not produced (full log: $MAKE_LOG)"
     exit 1
 fi
 
 blue "==> installing into $PREFIX"
-mkdir -p "$PREFIX/lib/sane" "$PREFIX/etc/sane.d" "$PREFIX/etc/hp" "$PREFIX/share/hplip/data/models/unreleased"
-cp .libs/libhpmud.0.dylib    "$PREFIX/lib/"
-cp .libs/libhpip.0.dylib     "$PREFIX/lib/"
-ln -sf libhpmud.0.dylib "$PREFIX/lib/libhpmud.dylib"
-ln -sf libhpip.0.dylib  "$PREFIX/lib/libhpip.dylib"
-cp .libs/libsane-hpaio.1.so "$PREFIX/lib/sane/"
-ln -sf libsane-hpaio.1.so "$PREFIX/lib/sane/libsane-hpaio.so"
-cp hplip.conf            "$PREFIX/etc/hp/"
-cp data/models/models.dat "$PREFIX/share/hplip/data/models/"
-[[ -f data/models/unreleased/unreleased.dat ]] && cp data/models/unreleased/unreleased.dat "$PREFIX/share/hplip/data/models/unreleased/" || \
-    : > "$PREFIX/share/hplip/data/models/unreleased/unreleased.dat"
+[[ -n "$SUDO" ]] && blue "    ($PREFIX is root-owned; sudo may ask for your password)"
+$SUDO mkdir -p "$PREFIX/lib/sane" "$PREFIX/etc/sane.d" "$PREFIX/etc/hp" "$PREFIX/share/hplip/data/models/unreleased"
+$SUDO cp .libs/libhpmud.0.dylib    "$PREFIX/lib/"
+$SUDO cp .libs/libhpip.0.dylib     "$PREFIX/lib/"
+$SUDO ln -sf libhpmud.0.dylib "$PREFIX/lib/libhpmud.dylib"
+$SUDO ln -sf libhpip.0.dylib  "$PREFIX/lib/libhpip.dylib"
+$SUDO cp .libs/libsane-hpaio.1.so "$PREFIX/lib/sane/"
+$SUDO ln -sf libsane-hpaio.1.so "$PREFIX/lib/sane/libsane-hpaio.so"
+$SUDO cp hplip.conf            "$PREFIX/etc/hp/"
+$SUDO cp data/models/models.dat "$PREFIX/share/hplip/data/models/"
+if [[ -f data/models/unreleased/unreleased.dat ]]; then
+    $SUDO cp data/models/unreleased/unreleased.dat "$PREFIX/share/hplip/data/models/unreleased/"
+else
+    $SUDO touch "$PREFIX/share/hplip/data/models/unreleased/unreleased.dat"
+fi
 
 # enable hpaio in dll.conf if not already there
 DLL_CONF="$PREFIX/etc/sane.d/dll.conf"
 if [[ ! -f "$DLL_CONF" ]] || ! grep -q '^hpaio$' "$DLL_CONF"; then
-    echo 'hpaio' >> "$DLL_CONF"
+    echo 'hpaio' | $SUDO tee -a "$DLL_CONF" >/dev/null
 fi
 
 # install hp-scan wrapper
-install -m 0755 "$SCRIPT_DIR/bin/hp-scan" "$PREFIX/bin/hp-scan"
+$SUDO install -m 0755 "$SCRIPT_DIR/bin/hp-scan" "$PREFIX/bin/hp-scan"
 
 # install HP Scan.app (clickable GUI wrapper) into ~/Applications
-APP="$HOME/Applications/HP Scan.app"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 install -m 0644 "$SCRIPT_DIR/app/Info.plist"   "$APP/Contents/Info.plist"
-install -m 0755 "$SCRIPT_DIR/app/hp-scan-app"  "$APP/Contents/MacOS/hp-scan-app"
+# the app script hardcodes /opt/homebrew; point it at $PREFIX instead
+sed "s|/opt/homebrew|$PREFIX|g" "$SCRIPT_DIR/app/hp-scan-app" > "$WORK/hp-scan-app"
+install -m 0755 "$WORK/hp-scan-app"            "$APP/Contents/MacOS/hp-scan-app"
 # refresh Launch Services so Spotlight / Dock find the new app
 /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$APP" >/dev/null 2>&1 || true
 
@@ -158,10 +242,13 @@ install -m 0755 "$SCRIPT_DIR/app/hp-scan-app"  "$APP/Contents/MacOS/hp-scan-app"
 if command -v go >/dev/null 2>&1; then
     blue "==> building airscan-bridge"
     (cd "$SCRIPT_DIR/airscan-bridge" && go build -o airscan-bridge .)
-    install -m 0755 "$SCRIPT_DIR/airscan-bridge/airscan-bridge" "$PREFIX/bin/airscan-bridge"
+    $SUDO install -m 0755 "$SCRIPT_DIR/airscan-bridge/airscan-bridge" "$PREFIX/bin/airscan-bridge"
+    # the plist hardcodes /opt/homebrew; point it at $PREFIX instead
+    PLIST="$WORK/com.nricaurte.hp-airscan.plist"
+    sed "s|/opt/homebrew|$PREFIX|g" "$SCRIPT_DIR/airscan-bridge/com.nricaurte.hp-airscan.plist" > "$PLIST"
     green ""
     green "Optional: install LaunchAgent so the bridge starts at login:"
-    green "  cp $SCRIPT_DIR/airscan-bridge/com.nricaurte.hp-airscan.plist ~/Library/LaunchAgents/"
+    green "  cp $PLIST ~/Library/LaunchAgents/"
     green "  launchctl load -w ~/Library/LaunchAgents/com.nricaurte.hp-airscan.plist"
     green ""
     green "Or run it ad-hoc:  airscan-bridge &"

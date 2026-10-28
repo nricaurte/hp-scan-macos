@@ -5,39 +5,86 @@ SCRIPT_LOG="/tmp/hp-scan-app.log"
 exec >"$SCRIPT_LOG" 2>&1
 set -x
 
+# UI language: HP_SCAN_LANG=en|es in ~/.config/hp-scan/config, otherwise the
+# macOS system language (Spanish if it starts with "es", English otherwise).
+CONFIG="$HOME/.config/hp-scan/config"
+[[ -f "$CONFIG" ]] && source "$CONFIG"
+if [[ -z "$HP_SCAN_LANG" ]]; then
+    SYS_LANG=$(defaults read -g AppleLanguages 2>/dev/null | awk -F'"' 'NF>1{print $2; exit}')
+    [[ "$SYS_LANG" == es* ]] && HP_SCAN_LANG=es || HP_SCAN_LANG=en
+fi
+
+if [[ "$HP_SCAN_LANG" == es ]]; then
+    T_NOTFOUND_TITLE="hp-scan no encontrado"
+    T_NOTFOUND_MSG="Instala desde https://github.com/nricaurte/hp-scan-macos primero."
+    T_NODEV_TITLE="No se detectó la impresora"
+    T_NODEV_MSG="Verifica que la HP esté encendida y conectada por USB, luego vuelve a intentar."
+    T_RES_PROMPT="Resolución (DPI):"
+    T_NEXT="Siguiente"
+    T_CANCEL="Cancelar"
+    T_MODE_PROMPT="Modo:"
+    T_COLOR="Color"
+    T_GRAY="Gris"
+    T_SCAN="Escanear"
+    T_SAVE_PROMPT="Guardar PDF como:"
+    T_PLACE="Coloca el documento en el escáner..."
+    T_SCANNING="Escaneando"
+    T_DONE="Listo"
+    T_ERR_TITLE="Error escaneando"
+    T_ERR_MSG="Detalles en $SCRIPT_LOG"
+else
+    T_NOTFOUND_TITLE="hp-scan not found"
+    T_NOTFOUND_MSG="Install it from https://github.com/nricaurte/hp-scan-macos first."
+    T_NODEV_TITLE="No printer detected"
+    T_NODEV_MSG="Make sure the HP is powered on and connected by USB, then try again."
+    T_RES_PROMPT="Resolution (DPI):"
+    T_NEXT="Next"
+    T_CANCEL="Cancel"
+    T_MODE_PROMPT="Mode:"
+    T_COLOR="Color"
+    T_GRAY="Gray"
+    T_SCAN="Scan"
+    T_SAVE_PROMPT="Save PDF as:"
+    T_PLACE="Place the document on the scanner..."
+    T_SCANNING="Scanning"
+    T_DONE="Done"
+    T_ERR_TITLE="Scan failed"
+    T_ERR_MSG="Details in $SCRIPT_LOG"
+fi
+
 if ! command -v hp-scan >/dev/null 2>&1; then
-    osascript -e 'display alert "hp-scan no encontrado" message "Instala desde https://github.com/nricaurte/hp-scan-macos primero." as critical'
+    osascript -e "display alert \"$T_NOTFOUND_TITLE\" message \"$T_NOTFOUND_MSG\" as critical"
     exit 1
 fi
 
-# 1) ¿Hay scanner detectado?
+# 1) Is a scanner detected?
 if ! /opt/homebrew/bin/scanimage -L 2>/dev/null | grep -q '^device'; then
-    osascript -e 'display alert "No se detectó la impresora" message "Verifica que la HP esté encendida y conectada por USB, luego vuelve a intentar." as critical'
+    osascript -e "display alert \"$T_NODEV_TITLE\" message \"$T_NODEV_MSG\" as critical"
     exit 1
 fi
 
-# 2) Pedir DPI
-RES=$(osascript <<'AS'
-choose from list {"100","150","200","300","600","1200"} with title "HP Scan" with prompt "Resolución (DPI):" default items {"300"} OK button name "Siguiente" cancel button name "Cancelar"
+# 2) Ask for DPI
+RES=$(osascript <<AS
+choose from list {"100","150","200","300","600","1200"} with title "HP Scan" with prompt "$T_RES_PROMPT" default items {"300"} OK button name "$T_NEXT" cancel button name "$T_CANCEL"
 AS
 )
 [[ "$RES" == "false" ]] && exit 0
 
-# 3) Pedir modo
-MODE=$(osascript <<'AS'
-choose from list {"Color","Gris"} with title "HP Scan" with prompt "Modo:" default items {"Color"} OK button name "Escanear" cancel button name "Cancelar"
+# 3) Ask for mode
+MODE=$(osascript <<AS
+choose from list {"$T_COLOR","$T_GRAY"} with title "HP Scan" with prompt "$T_MODE_PROMPT" default items {"$T_COLOR"} OK button name "$T_SCAN" cancel button name "$T_CANCEL"
 AS
 )
 [[ "$MODE" == "false" ]] && exit 0
 SMODE=color
-[[ "$MODE" == "Gris" ]] && SMODE=gray
+[[ "$MODE" == "$T_GRAY" ]] && SMODE=gray
 
-# 4) Pedir destino (con default razonable)
+# 4) Ask for destination (with a sensible default)
 DEFAULT_NAME="Scan-$(date +%Y-%m-%d-%H%M%S).pdf"
 DEST=$(osascript <<AS
 set defaultName to "$DEFAULT_NAME"
 try
-    set theFile to choose file name with prompt "Guardar PDF como:" default name defaultName default location (path to desktop folder)
+    set theFile to choose file name with prompt "$T_SAVE_PROMPT" default name defaultName default location (path to desktop folder)
     return POSIX path of theFile
 on error
     return "CANCEL"
@@ -47,14 +94,14 @@ AS
 [[ "$DEST" == "CANCEL" || -z "$DEST" ]] && exit 0
 [[ "$DEST" != *.pdf ]] && DEST="${DEST}.pdf"
 
-# 5) Notificación de inicio
-osascript -e 'display notification "Coloca el documento en el escáner..." with title "HP Scan" subtitle "Escaneando"'
+# 5) Start notification
+osascript -e "display notification \"$T_PLACE\" with title \"HP Scan\" subtitle \"$T_SCANNING\""
 
-# 6) Escanear
+# 6) Scan
 if /opt/homebrew/bin/hp-scan "$DEST" "$RES" "$SMODE"; then
-    osascript -e "display notification \"$(basename "$DEST")\" with title \"HP Scan\" subtitle \"Listo\" sound name \"Glass\""
+    osascript -e "display notification \"$(basename "$DEST")\" with title \"HP Scan\" subtitle \"$T_DONE\" sound name \"Glass\""
     /usr/bin/open "$DEST"
 else
-    osascript -e 'display alert "Error escaneando" message "Detalles en /tmp/hp-scan-app.log" as critical'
+    osascript -e "display alert \"$T_ERR_TITLE\" message \"$T_ERR_MSG\" as critical"
     exit 1
 fi

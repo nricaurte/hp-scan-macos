@@ -1,7 +1,6 @@
 --- a/scan/sane/hpaio.c
 +++ b/scan/sane/hpaio.c
-@@ -377,8 +377,12 @@ extern SANE_Status sane_hpaio_get_devices(const SANE_Device ***deviceList, SANE_
-    DBG(8, "sane_hpaio_get_devices(local=%d): %s %d\n", localOnly, __FILE__, __LINE__);
+@@ -378,8 +378,13 @@
     ResetDeviceList(&DeviceList);
     DevDiscovery(localOnly);
     *deviceList = (const SANE_Device **)DeviceList;
@@ -12,6 +11,6 @@
     SANE_Device*** devList;
     orblite_get_devices(devList, localOnly);
 +#endif
-
+ 
     return SANE_STATUS_GOOD;
  }

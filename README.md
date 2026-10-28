@@ -73,11 +73,20 @@ cd hp-scan-macos
 ./build.sh
 ```
 
-Build downloads HPLIP source from SourceForge (~30 MB), applies patches,
-compiles to `/opt/homebrew/lib/sane/libsane-hpaio.1.so`, registers `hpaio`
-in `/opt/homebrew/etc/sane.d/dll.conf`, and installs `hp-scan` wrapper.
+Works with **Homebrew** or **MacPorts** (useful on older Intel Macs). The
+script detects which one you have and installs `libusb` and `sane-backends`
+through it if missing. Run it as your normal user, **not** with `sudo`. With
+MacPorts it asks for your password only for the steps that write to
+`/opt/local`.
 
-If you don't use Homebrew at the default location, set `PREFIX=/your/path`.
+Build downloads HPLIP source from SourceForge (~30 MB), applies patches,
+compiles to `$PREFIX/lib/sane/libsane-hpaio.1.so`, registers `hpaio`
+in `$PREFIX/etc/sane.d/dll.conf`, and installs `hp-scan` wrapper.
+`$PREFIX` is `brew --prefix` (usually `/opt/homebrew`) or `/opt/local` for
+MacPorts.
+
+If both are installed, pick one with `PKG_MGR=brew` or `PKG_MGR=macports`.
+To use some other install location, set `PREFIX=/your/path`.
 
 ## Install with Claude Code
 
@@ -115,6 +124,10 @@ scanimage -d hpaio:/usb/Smart_Tank_500_series?serial=XXX --resolution 600 -o foo
 The build also installs a clickable `HP Scan.app` into `~/Applications/`. Double-click,
 pick DPI (100/150/200/300/600/1200), pick mode (Color/Gray), pick a save path, scan.
 The PDF opens in Preview automatically. Find it in Spotlight as "HP Scan".
+
+The app's dialogs follow your macOS system language (English or Spanish). To
+force one, create `~/.config/hp-scan/config` containing `HP_SCAN_LANG=en` or
+`HP_SCAN_LANG=es`.
 
 **Image Capture / Preview / Notes / iPhone-iPad (via airscan-bridge):**
 The build also installs a small Go service (`airscan-bridge`) that advertises

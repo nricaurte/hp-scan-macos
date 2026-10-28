@@ -20,8 +20,9 @@ case "$MODE_INPUT" in
     *)              SANE_MODE="Color" ;;
 esac
 
-# Auto-detect first hpaio device.
-DEV=$(scanimage -L 2>/dev/null | awk -F"'" '/hpaio:/{print $2; exit}')
+# Auto-detect first hpaio device. sane-backends < 1.4 quotes it as `dev',
+# 1.4+ as 'dev', so pull out the hpaio:... token itself.
+DEV=$(scanimage -L 2>/dev/null | grep -o "hpaio:[^'\`]*" | head -n 1 || true)
 if [[ -z "${DEV:-}" ]]; then
     echo "✗ no HP scanner detected. Is the printer powered on and USB connected?"
     echo "  run \`scanimage -L\` to debug."
